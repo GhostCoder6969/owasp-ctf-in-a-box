@@ -142,7 +142,9 @@ const settings: AdminSettings = {
   aiCooldownSec: null,
   teamMaxMembers: null,
   scoreCooldownMin: null,
-  scoringStartsAt: null,
+  // A LAUNCHED event (#464: no scoring start = not launched = registration
+  // phase), so the live-event renders below keep describing a live event.
+  scoringStartsAt: "2000-01-01T00:00:00.000Z",
   scoringEndsAt: null,
   registrationStartsAt: null,
   registrationEndsAt: null,
@@ -368,11 +370,33 @@ describe("AdminControls panel contents", () => {
     expect(eventPanel).toContain("registration is open");
   });
 
+  // #464: a blank Scoring opens now means "not launched", so the help text
+  // must not tell an organizer every date is optional.
+  it("says Scoring opens is required to launch, the other dates optional", () => {
+    const html = renderToStaticMarkup(<AdminControls viewerLogin="organizer" eventName="OWASP CTF in a Box" defaultModuleIds={["secure-development"]} secureDevAvailable initial={settings} modules={twoModules} />);
+    const eventPanel = panelFor(html, "event");
+    expect(eventPanel).toContain("Scoring opens is required");
+    expect(eventPanel).not.toContain("Optional. Times are your local time");
+  });
+
   it("names WHY scoring is frozen — manual freeze vs a closed window", () => {
     const manuallyFrozen = renderToStaticMarkup(
       <AdminControls viewerLogin="organizer" eventName="OWASP CTF in a Box" defaultModuleIds={["secure-development"]} secureDevAvailable initial={{ ...settings, paused: true }} modules={twoModules} />,
     );
     expect(panelFor(manuallyFrozen, "event")).toContain("scoring is frozen (manual)");
+
+    // #464: no scoring start at all reads as "not launched", distinct from a
+    // closed window — the organizer's fix differs (set a start vs move it).
+    const notLaunched = renderToStaticMarkup(
+      <AdminControls viewerLogin="organizer" eventName="OWASP CTF in a Box" defaultModuleIds={["secure-development"]} secureDevAvailable initial={{ ...settings, scoringStartsAt: null }} modules={twoModules} />,
+    );
+    expect(panelFor(notLaunched, "event")).toContain("scoring is closed (not launched");
+    // An unparseable start (hand-written via redis-cli) is "not launched" to
+    // every reader, so the readout must say so too — not "outside its window".
+    const garbledStart = renderToStaticMarkup(
+      <AdminControls viewerLogin="organizer" eventName="OWASP CTF in a Box" defaultModuleIds={["secure-development"]} secureDevAvailable initial={{ ...settings, scoringStartsAt: "nope" }} modules={twoModules} />,
+    );
+    expect(panelFor(garbledStart, "event")).toContain("scoring is closed (not launched");
 
     const windowClosed = renderToStaticMarkup(
       <AdminControls

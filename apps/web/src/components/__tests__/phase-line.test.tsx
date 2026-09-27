@@ -30,8 +30,14 @@ beforeEach(() => {
 });
 
 describe("resolvePhase", () => {
-  it("is live on a dateless, unpaused event", async () => {
+  // #464: no scoring start = not launched — the pre-launch lobby.
+  it("is registration on a dateless, unpaused event (not launched)", async () => {
     mocks.getAdminSettings.mockResolvedValue({});
+    expect((await resolvePhase())?.phase).toBe("registration");
+  });
+
+  it("is live once the scoring start has passed", async () => {
+    mocks.getAdminSettings.mockResolvedValue({ scoringStartsAt: iso(-HOUR) });
     expect((await resolvePhase())?.phase).toBe("live");
   });
 
@@ -41,12 +47,13 @@ describe("resolvePhase", () => {
   });
 
   it("is results after the scoring close, even while paused", async () => {
-    mocks.getAdminSettings.mockResolvedValue({ scoringEndsAt: iso(-HOUR), paused: true });
+    mocks.getAdminSettings.mockResolvedValue({ scoringStartsAt: iso(-2 * HOUR), scoringEndsAt: iso(-HOUR), paused: true });
     expect((await resolvePhase())?.phase).toBe("results");
   });
 
   it("is frozen under a manual pause mid-event", async () => {
-    mocks.getAdminSettings.mockResolvedValue({ paused: true });
+    // Mid-event = launched (#464: no start means not launched, not frozen).
+    mocks.getAdminSettings.mockResolvedValue({ scoringStartsAt: iso(-HOUR), paused: true });
     expect((await resolvePhase())?.phase).toBe("frozen");
   });
 
@@ -71,7 +78,7 @@ describe("PhaseLine", () => {
   });
 
   it("inserts the frozen stop only while actually frozen", async () => {
-    const html = await render({ paused: true });
+    const html = await render({ scoringStartsAt: iso(-HOUR), paused: true });
     expect(html).toContain('aria-label="Event phase: frozen"');
     expect(html).toContain("frozen");
   });

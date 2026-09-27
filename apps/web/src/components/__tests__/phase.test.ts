@@ -11,8 +11,17 @@ const HOUR = 60 * 60 * 1000;
 const iso = (offsetMs: number) => new Date(Date.now() + offsetMs).toISOString();
 
 describe("phaseFromSettings", () => {
-  it("is live on a dateless, unpaused event", () => {
-    expect(phaseFromSettings({ paused: false, scoringStartsAt: null, scoringEndsAt: null }).phase).toBe("live");
+  // #464: no scoring start = not launched — the pre-launch lobby, not live.
+  it("is registration on a dateless, unpaused event (not launched)", () => {
+    expect(phaseFromSettings({ paused: false, scoringStartsAt: null, scoringEndsAt: null }).phase).toBe("registration");
+  });
+
+  it("is registration when the scoring start is unparseable (not launched)", () => {
+    expect(phaseFromSettings({ paused: false, scoringStartsAt: "nope", scoringEndsAt: null }).phase).toBe("registration");
+  });
+
+  it("is live once the scoring start has passed", () => {
+    expect(phaseFromSettings({ paused: false, scoringStartsAt: iso(-HOUR), scoringEndsAt: null }).phase).toBe("live");
   });
 
   it("is registration before the scoring open", () => {
@@ -23,12 +32,23 @@ describe("phaseFromSettings", () => {
 
   it("is results after the scoring close, even while paused", () => {
     expect(
-      phaseFromSettings({ paused: true, scoringStartsAt: null, scoringEndsAt: iso(-HOUR) }).phase,
+      phaseFromSettings({ paused: true, scoringStartsAt: iso(-2 * HOUR), scoringEndsAt: iso(-HOUR) }).phase,
     ).toBe("results");
   });
 
+  // #464: an event that never launched has no results to show, whatever its
+  // end date says — the lobby, not "See the final standings".
+  it("is registration, not results, when there is no start even if the end has passed", () => {
+    expect(
+      phaseFromSettings({ paused: false, scoringStartsAt: null, scoringEndsAt: iso(-HOUR) }).phase,
+    ).toBe("registration");
+    expect(
+      phaseFromSettings({ paused: true, scoringStartsAt: "nope", scoringEndsAt: iso(-HOUR) }).phase,
+    ).toBe("registration");
+  });
+
   it("is frozen under a manual pause mid-event", () => {
-    expect(phaseFromSettings({ paused: true, scoringStartsAt: null, scoringEndsAt: null }).phase).toBe("frozen");
+    expect(phaseFromSettings({ paused: true, scoringStartsAt: iso(-HOUR), scoringEndsAt: null }).phase).toBe("frozen");
   });
 
   it("accepts an explicit `now` so a caller can recompute after a settings change without re-reading the clock", () => {
