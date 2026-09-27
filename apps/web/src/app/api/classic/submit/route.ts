@@ -1,7 +1,7 @@
 import { NextResponse } from "next/server";
 import { auth } from "@/lib/auth";
 import { logActivity } from "@/lib/activity-log";
-import { requireLaunchedApi } from "@/lib/launch";
+import { launchApiAccess } from "@/lib/launch";
 import { CLASSIC_ID_RE, submitFlag } from "@/lib/classic-store";
 import { hasTeam } from "@/lib/team-store";
 
@@ -49,10 +49,11 @@ export async function POST(request: Request) {
   const login = (session.user as { login?: string }).login;
   if (!login) return NextResponse.json({ error: "session has no GitHub login" }, { status: 400 });
 
-  // #464 pre-launch lock (admins pass as a preview). Its own refusal —
-  // 403 `not-launched` — never a wrong-answer shape.
-  const notLaunched = await requireLaunchedApi(login);
-  if (notLaunched) return notLaunched;
+  // #464 pre-launch lock. Its own refusal — 403 `not-launched` — never a
+  // wrong-answer shape. An admin before launch passes as a PREVIEW, and their
+  // flag is graded as a dry run: the same script, writing nothing.
+  const { refused, preview } = await launchApiAccess(login);
+  if (refused) return refused;
 
   // Scoring is per team, and a teamless login's banked points fold into no
   // team total (issue #153). Refused here, AFTER the launch lock (a pre-launch lockout
@@ -63,7 +64,9 @@ export async function POST(request: Request) {
   //
   // This runs before the body is even parsed, so a teamless caller cannot use
   // the response to distinguish a correct flag from a wrong one.
-  if (!(await hasTeam(login))) {
+  // A preview (#464) skips the team check: a dry run banks nothing to fold
+  // into a team, and organizers usually have none.
+  if (!preview && !(await hasTeam(login))) {
     return NextResponse.json({ error: "no-team" }, { status: 403 });
   }
 
@@ -74,8 +77,16 @@ export async function POST(request: Request) {
     return NextResponse.json({ error: "invalid request" }, { status: 400 });
   }
 
-  const result = await submitFlag(login, challengeId, flag);
+  const result = await submitFlag(login, challengeId, flag, { dryRun: preview });
   if (result.ok) {
+    // An admin preview (#464): graded by the same script, nothing recorded —
+    // and nothing logged either, so the activity feed never shows a solve
+    // that did not happen. `dryRun` rides along so the UI can say so.
+    if (result.dryRun) {
+      return result.correct
+        ? NextResponse.json({ correct: true, points: result.points, dryRun: true })
+        : NextResponse.json({ correct: false, dryRun: true });
+    }
     if (!result.correct) return NextResponse.json({ correct: false });
     // Activity log (issue #212): fresh solves only — an idempotent
     // re-submission banked nothing and would double-count the event. The id,

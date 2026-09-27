@@ -5,6 +5,9 @@
 // timestamp tests are only meaningful if the real one runs. Time is pinned
 // with fake timers instead.
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+// #464: a preview token is honoured only while the event is not launched.
+const aiPreview = vi.hoisted(() => ({ previewClaimStillValid: vi.fn(async () => true) }));
+vi.mock("@/lib/ai-preview", () => aiPreview);
 
 const mocks = vi.hoisted(() => ({
   verifyLaunchToken: vi.fn(),
@@ -119,7 +122,7 @@ describe("POST /api/ai/event", () => {
     expect(mocks.claimAiNonce).toHaveBeenCalledWith("nonce-1");
     expect(mocks.consumeRateLimit).toHaveBeenCalledWith("ai-event", "alice", 60, 60);
     expect(mocks.hasTeam).toHaveBeenCalledWith("alice");
-    expect(mocks.awardAiEvent).toHaveBeenCalledWith("alice", CHAL, { dryRun: false });
+    expect(mocks.awardAiEvent).toHaveBeenCalledWith("alice", CHAL, { dryRun: false, preview: false });
   });
 
   it("logs a fresh award to the activity log, naming the event path", async () => {
@@ -176,7 +179,7 @@ describe("POST /api/ai/event", () => {
   it("takes identity from the token, never from the body", async () => {
     allGatesOpen("alice");
     await POST(signed(bodyFor({ login: "mallory", sub: "mallory" })));
-    expect(mocks.awardAiEvent).toHaveBeenCalledWith("alice", CHAL, { dryRun: false });
+    expect(mocks.awardAiEvent).toHaveBeenCalledWith("alice", CHAL, { dryRun: false, preview: false });
   });
 
   it("refuses a bad signature before it ever looks at the token", async () => {
@@ -290,7 +293,7 @@ describe("POST /api/ai/event", () => {
     // The nonce is a WRITE. A dry run that claimed one would burn the jti and
     // make the organizer's next real event look like a replay.
     expect(mocks.claimAiNonce).not.toHaveBeenCalled();
-    expect(mocks.awardAiEvent).toHaveBeenCalledWith("alice", CHAL, { dryRun: true });
+    expect(mocks.awardAiEvent).toHaveBeenCalledWith("alice", CHAL, { dryRun: true, preview: false });
     // A dry run logs nothing — the activity log is for solves that actually
     // happened, and this one is only a verdict.
     expect(mocks.logActivity).not.toHaveBeenCalled();
@@ -332,7 +335,7 @@ describe("POST /api/ai/event", () => {
       allGatesOpen();
       const res = await POST(signed(bodyFor(over)));
       expect(res.status, JSON.stringify(over)).toBe(200);
-      expect(mocks.awardAiEvent).toHaveBeenCalledWith("alice", CHAL, { dryRun: false });
+      expect(mocks.awardAiEvent).toHaveBeenCalledWith("alice", CHAL, { dryRun: false, preview: false });
     }
   });
 
@@ -491,5 +494,44 @@ describe("POST /api/ai/event", () => {
     const res = await OPTIONS();
     expect(res.status).toBe(204);
     expect(res.headers.get("access-control-allow-methods")).toContain("POST");
+  });
+});
+
+describe("POST /api/ai/event with a preview token (#464)", () => {
+  it("treats a preview admin's event as a dry run: no nonce spent, nothing awarded", async () => {
+    allGatesOpen();
+    mocks.verifyLaunchToken.mockReturnValue({ ok: true, claims: { sub: "alice", aud: CHAL, jti: "nonce-1", ctf: { preview: true } } });
+    mocks.awardAiEvent.mockResolvedValue({ ok: true, correct: true, points: 0, dryRun: true });
+    const res = await POST(signed(bodyFor()));
+    expect(res.status).toBe(200);
+    expect((await res.json()).dryRun).toBe(true);
+    expect(mocks.awardAiEvent).toHaveBeenCalledWith("alice", CHAL, { dryRun: false, preview: true });
+    expect(mocks.claimAiNonce).not.toHaveBeenCalled();
+  });
+});
+
+describe("a preview event token after launch, or on a teamless admin (#464)", () => {
+  const previewClaims = { sub: "alice", aud: CHAL, jti: "nonce-1", ctf: { preview: true } };
+
+  it("is refused once the event has launched", async () => {
+    allGatesOpen();
+    mocks.verifyLaunchToken.mockReturnValue({ ok: true, claims: previewClaims });
+    aiPreview.previewClaimStillValid.mockResolvedValueOnce(false);
+    const res = await POST(signed(bodyFor()));
+    expect(res.status).toBe(401);
+    expect(await res.json()).toEqual({ error: "invalid-token" });
+    expect(mocks.awardAiEvent).not.toHaveBeenCalled();
+  });
+
+  it("is graded for a teamless preview admin, and does not claim to have checked the schedule", async () => {
+    allGatesOpen();
+    mocks.verifyLaunchToken.mockReturnValue({ ok: true, claims: previewClaims });
+    mocks.hasTeam.mockResolvedValue(false);
+    mocks.awardAiEvent.mockResolvedValue({ ok: true, correct: true, points: 400, dryRun: true });
+    const res = await POST(signed(bodyFor()));
+    expect(res.status).toBe(200);
+    const json = await res.json();
+    expect(json.dryRun).toBe(true);
+    expect(json.checks).not.toContain("schedule");
   });
 });

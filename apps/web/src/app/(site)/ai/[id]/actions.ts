@@ -50,10 +50,12 @@ const FLAG_MAX_LEN = 512;
  *  deliberately absent: `submitAiFlag` never produces one. */
 function toResponse(result: AiSubmitResult): SubmitResponse {
   if (result.ok) {
-    if (!result.correct) return { correct: false };
+    // `dryRun` (#464 admin preview) rides along so the form says nothing was recorded.
+    const dry = result.dryRun ? { dryRun: true } : {};
+    if (!result.correct) return { correct: false, ...dry };
     // `already` rides along defaulted rather than omitted, same as the route:
     // a caller must never have to read a missing key as "false" itself.
-    return { correct: true, points: result.points, already: result.already ?? false };
+    return { correct: true, points: result.points, already: result.already ?? false, ...dry };
   }
   if (result.reason === "cooldown" && result.retryAt) return { error: "cooldown", retryAt: result.retryAt };
   return { error: result.reason };
@@ -85,7 +87,8 @@ export async function submitAiFlagAction(challengeId: string, flag: string): Pro
   // #464 pre-launch lock, CLOSED on uncertainty (getLaunchAccess never
   // throws: a failed read counts as "not launched"), and the opposite
   // direction from the team check below. Admins pass as a preview.
-  if (!(await getLaunchAccess(login)).allowed) return { error: "not-launched" };
+  const launch = await getLaunchAccess(login);
+  if (!launch.allowed) return { error: "not-launched" };
 
   // Fails OPEN — same doctrine as the manual-freeze read, and the opposite
   // direction from the launch lock above: a team-store error must not drop a solve a
@@ -100,18 +103,21 @@ export async function submitAiFlagAction(challengeId: string, flag: string): Pro
   } catch {
     teamed = true;
   }
-  if (!teamed) return { error: "no-team" };
+  // A preview (#464) skips the team check: a dry run banks nothing to fold
+  // into a team, and organizers usually have none.
+  if (!teamed && !launch.preview) return { error: "no-team" };
 
   if (typeof challengeId !== "string" || !AI_ID_RE.test(challengeId)) return { error: "invalid" };
   if (typeof flag !== "string" || !flag.trim() || flag.length > FLAG_MAX_LEN) return { error: "invalid" };
 
-  const result = await submitAiFlag(login, challengeId, flag);
+  const result = await submitAiFlag(login, challengeId, flag, { dryRun: launch.preview });
   // Activity log (issue #212): fresh solves only — an idempotent
   // re-submission banked nothing and would double-count the event. The id
   // and the path, never the flag; logActivity is fail-open, so it cannot
   // fail an award that already landed. Mirrors api/ai/submit's guard —
   // this action is the third award surface and was the only one not logging.
-  if (result.ok && result.correct && !result.already) {
+  // Never for a dry run (#464 admin preview): nothing was solved.
+  if (result.ok && result.correct && !result.already && !result.dryRun) {
     await logActivity("ai-solve", login, `${challengeId} via flag`);
   }
   return toResponse(result);

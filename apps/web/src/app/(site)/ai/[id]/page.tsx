@@ -23,6 +23,7 @@
 // in `[id]/not-found.tsx`).
 
 import type { Metadata } from "next";
+import PreviewBanner from "@/components/preview-banner";
 import { headers } from "next/headers";
 import Link from "next/link";
 import { notFound } from "next/navigation";
@@ -80,7 +81,7 @@ export default async function AiChallengePage({ params }: { params: Promise<{ id
   // token mint, which is only safe to hand out once this check has passed
   // (the AI API routes trust a token in hand). ./actions.ts checks again: it
   // is the other way in.
-  await redirectIfNotLaunched(login);
+  const launch = await redirectIfNotLaunched(login);
   const viewerIsAdmin = await isAdminLogin(login);
 
   // Same order as /ai and /flags/[id]: the team redirect fires before the
@@ -130,11 +131,13 @@ export default async function AiChallengePage({ params }: { params: Promise<{ id
   // this one); `challenge` and `viewerAi` are exactly what was just built
   // above, nothing re-fetched or reshaped for the mint.
   const launchUrl = login
-    ? await mintLaunchUrl({ origin: resolveOrigin(), login, challenge, challenges, viewer: viewerAi })
+    ? await mintLaunchUrl({ origin: resolveOrigin(), login, challenge, challenges, viewer: viewerAi, preview: launch.preview })
     : null;
 
   return (
     <div className="flex flex-col gap-6">
+      {/* #464: an admin browsing before launch sees what contestants will. */}
+      {launch.preview && <PreviewBanner />}
       {viewerIsTeamless && <TeamlessNotice what="solves" />}
       <div className="flex flex-col gap-3">
         <Link href="/ai" className="ds-link w-fit text-sm">

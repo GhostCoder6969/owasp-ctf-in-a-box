@@ -17,11 +17,15 @@
 
 import { inspect } from "node:util";
 import { beforeEach, describe, expect, it, vi } from "vitest";
+// The activity log, so the dry-run test below can see that nothing was logged.
+const activityLog = vi.hoisted(() => ({ logActivity: vi.fn(async () => {}) }));
+vi.mock("@/lib/activity-log", () => activityLog);
 
 const {
   getSession,
   requireAdmin,
   requireLaunchedApi,
+  launchApiAccess,
   hasTeam,
   answerQuestion,
   listQuestions,
@@ -49,6 +53,7 @@ const {
     getSession: vi.fn(),
     requireAdmin: vi.fn(),
     requireLaunchedApi: vi.fn(),
+    launchApiAccess: vi.fn(),
     hasTeam: vi.fn(),
     answerQuestion: vi.fn(),
     listQuestions: vi.fn(),
@@ -65,7 +70,7 @@ const {
 vi.mock("server-only", () => ({}));
 vi.mock("@/lib/auth", () => ({ auth: { api: { getSession } } }));
 vi.mock("@/lib/admin-auth", () => ({ requireAdmin }));
-vi.mock("@/lib/launch", () => ({ requireLaunchedApi }));
+vi.mock("@/lib/launch", () => ({ requireLaunchedApi, launchApiAccess }));
 vi.mock("@/lib/team-store", () => ({ hasTeam }));
 vi.mock("@/lib/quiz-store", () => ({
   answerQuestion,
@@ -137,6 +142,7 @@ beforeEach(() => {
   getSession.mockResolvedValue(SESSION);
   requireAdmin.mockResolvedValue({ ok: true, login: "alice" });
   requireLaunchedApi.mockResolvedValue(null);
+  launchApiAccess.mockImplementation(async (login: string) => ({ refused: await requireLaunchedApi(login), preview: false }));
   hasTeam.mockResolvedValue(true);
   writeAdminAudit.mockResolvedValue(undefined);
 });
@@ -172,7 +178,7 @@ describe("POST /api/quiz/answer", () => {
     answerQuestion.mockResolvedValue({ ok: true, correct: true, points: 10 });
     const res = await answerPOST(answerReq({ questionId: "q1", choices: ["b"] }));
     expect(res.status).toBe(200);
-    expect(answerQuestion).toHaveBeenCalledWith("alice", "q1", ["b"]);
+    expect(answerQuestion).toHaveBeenCalledWith("alice", "q1", ["b"], { dryRun: false });
   });
 
   // --- the team requirement (issue #153) ------------------------------------
@@ -221,7 +227,7 @@ describe("POST /api/quiz/answer", () => {
   it("derives login from the session, never the request body", async () => {
     answerQuestion.mockResolvedValue({ ok: true, correct: false });
     await answerPOST(answerReq({ questionId: "q1", choices: ["b"], login: "mallory" }));
-    expect(answerQuestion).toHaveBeenCalledWith("alice", "q1", ["b"]);
+    expect(answerQuestion).toHaveBeenCalledWith("alice", "q1", ["b"], { dryRun: false });
   });
 
   it("404 for an unknown/missing question", async () => {
@@ -619,5 +625,36 @@ describe("POST payload key sets", () => {
   it("never overlap", () => {
     const overlap = [...QUESTION_KEYS].filter((k) => IMPORT_KEYS.has(k));
     expect(overlap).toEqual([]);
+  });
+});
+
+describe("POST /api/quiz/answer admin preview (#464)", () => {
+  it("grades a preview admin's answer as a dry run", async () => {
+    launchApiAccess.mockResolvedValueOnce({ refused: null, preview: true });
+    answerQuestion.mockResolvedValue({ ok: true, correct: true, points: 10, dryRun: true });
+    const res = await answerPOST(answerReq({ questionId: "q1", choices: ["b"] }));
+    expect(res.status).toBe(200);
+    expect(answerQuestion).toHaveBeenCalledWith("alice", "q1", ["b"], { dryRun: true });
+  });
+});
+
+describe("a dry-run answer (#464 admin preview)", () => {
+  it("says dryRun and writes no activity-log line", async () => {
+    activityLog.logActivity.mockClear();
+    launchApiAccess.mockResolvedValueOnce({ refused: null, preview: true });
+    answerQuestion.mockResolvedValue({ ok: true, correct: true, points: 10, dryRun: true });
+    const res = await answerPOST(answerReq({ questionId: "q1", choices: ["b"] }));
+    expect((await res.json()).dryRun).toBe(true);
+    expect(activityLog.logActivity).not.toHaveBeenCalled();
+  });
+});
+
+describe("a teamless admin preview on the quiz (#464)", () => {
+  it("is graded (dry) even with no team", async () => {
+    launchApiAccess.mockResolvedValueOnce({ refused: null, preview: true });
+    hasTeam.mockResolvedValue(false);
+    answerQuestion.mockResolvedValue({ ok: true, correct: true, points: 10, dryRun: true });
+    const res = await answerPOST(answerReq({ questionId: "q1", choices: ["b"] }));
+    expect(res.status).toBe(200);
   });
 });

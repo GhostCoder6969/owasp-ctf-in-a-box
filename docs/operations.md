@@ -1510,9 +1510,9 @@ signs a demo event with the challenge's real key and runs the whole pipeline
 with `dryRun: true` — writing no solve and claiming no nonce — then relays
 the box's own verdict. **Would award** is the answer you want; every other
 verdict is read in the Send test list further down this section. Before
-the event is launched (no scoring start set), every dry run answers
-`paused`. A pre-launch dry run that can reach **Would award** arrives with
-#464's admin preview.
+the event is launched, the Send test mints its demo token as an admin
+preview, so the dry run is graded while scoring is closed and can reach
+**Would award**.
 
 **Authoring** happens in `/admin`, under the AI module's tab. Before adding
 a challenge you need at least one **category** — same chip row as classic's
@@ -1657,14 +1657,17 @@ carries:
   under that name for every verdict listed below, so the table here is a
   reference rather than something to look up mid-event. Reading the result:
   - **`would-award`** (shown as the green line) — good: the dry run
-    verified the whole pipeline end
-    to end (signature, token, rate limit, team, schedule).
+    verified the whole pipeline end to end. After launch that is signature,
+    token, rate limit, team and schedule. Before launch the test runs as an
+    admin preview, which skips the team and schedule gates, so the verdict
+    vouches for signature, token and rate limit only.
   - **`paused`**, **`solved`**, **`no-team`** — the signature and token
-    were fine and a gate refused the award, relayed as-is: scoring is frozen,
-    outside its scheduled window, or not launched yet (no scoring start set;
-    the dry run honours the schedule like a real event), the organizer's own login already holds this challenge, or
-    the organizer is on no team (the event route refuses a teamless login
-    before the award, organizers included). None of these is a fault on the
+    were fine and a gate refused the award, relayed as-is. `solved`: the
+    organizer's own login already holds this challenge. After launch only:
+    `paused` means scoring is frozen or outside its scheduled window, and
+    `no-team` means the organizer is on no team (the event route refuses a
+    teamless login before the award, organizers included). Before launch a
+    preview skips both of those gates. None of these is a fault on the
     external side.
   - **`unavailable`** — Redis could not be read, or the request itself
     failed; try again.
@@ -2011,9 +2014,18 @@ previewing the event can open one, as described next.
 
 **Admins preview.** A signed-in admin (`ADMIN_LOGINS`, or an admin added in
 the panel) passes the lock and browses every module page as a preview, to
-check the board before contestants see it. The preview does not open
-scoring: the scoring window still says "not launched", so an admin's
-submission before the start banks nothing.
+check the board before contestants see it. Every module page shows a
+**Preview — event not launched** banner, with a **View as contestant** link
+(the landing page, which is all a contestant sees) and a link to `/admin`.
+An admin's submissions are graded as **dry runs**: a flag, a quiz answer,
+an AI flag or event, or a hint reveal goes through the same grading script
+as a real one, and that script writes nothing. There's no solve, no points,
+no attempt or cooldown, no solve count, no hint charge and no activity-log
+line. Rate-limit counters still count, as they do for any caller. The answer
+says so ("preview only, nothing was recorded"). A preview needs no team.
+Once the event launches, admins score like anyone else. An AI launch token
+minted during the preview is refused after launch, so re-open the challenge
+for a normal one.
 
 **Fail direction: closed.** The lock is a secrecy boundary (challenge text
 before kickoff), so if the settings read fails, a non-admin is treated as
