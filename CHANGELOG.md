@@ -292,9 +292,15 @@ repo-level — `apps/web/package.json` tracks the current tag; `scorer` and
   - The scorer has a Cloud Map name and its own security group, reachable on
     `:4000` from the app and sync only.
   - On every deployment, not only AWS: when `GITHUB_APP_INSTALLATION_ID` is
-    unset, sync now uses the App's installation on `GITHUB_ORG`. It used to
-    take the first installation the App had, which polls nothing when that
-    is another org, and it now refuses an App installed only elsewhere.
+    unset, sync now asks GitHub for the App's installation on `GITHUB_ORG`.
+    It used to take the first installation the App listed, which polls
+    nothing when that is another org, and it now refuses an App not
+    installed there. A non-numeric `GITHUB_APP_INSTALLATION_ID` is refused
+    at start-up, and the Terraform variables check both App ids at plan
+    time.
+  - Traffic between the stack's own services stays HTTP with a bearer
+    token, with the network as the boundary (ADR 63). TLS on those hops is
+    the post-event follow-up #484.
   - `stack.tftest.hcl` now reads `docker-compose.yml` and fails if any
     environment key compose gives the app, the scorer or sync is missing from
     its ECS task.

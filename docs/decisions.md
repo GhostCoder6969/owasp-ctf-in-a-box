@@ -3759,7 +3759,8 @@ because that hop leaves our tasks for a managed service.
 - **What changes the answer.** Another tenant or workload sharing the
   network; a hop that crosses it (another VPC, another account, the public
   internet); or a stack that outlives an event. Any of these makes internal
-  TLS the right call, and the post-event follow-up issue tracks doing it.
+  TLS the right call, and
+  [#484](https://github.com/OWASP/owasp-ctf-in-a-box/issues/484) tracks doing it after the first event.
 
 **Consequences.** A review should not flag plaintext HTTP between the stack's
 own services as such. It should flag a new internal hop without a bearer
