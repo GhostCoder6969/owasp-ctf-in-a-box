@@ -75,7 +75,7 @@ their **Status** line; the record itself is never rewritten.
 - [ADR 60 — Stories: first-class objects, a derived unlock, and team scope](#adr-60-stories-first-class-objects-a-derived-unlock-and-team-scope)
 - [ADR 61 — Challenge attachments live in Redis, served only as downloads, behind the challenge's own visibility](#adr-61-challenge-attachments-live-in-redis-served-only-as-downloads-behind-the-challenges-own-visibility)
 - [ADR 62 — The landing page's footer does not repeat the sponsor credit](#adr-62-the-landing-pages-footer-does-not-repeat-the-sponsor-credit)
-- [ADR 63 — Service hops inside the stack are HTTP with a bearer token; the network is the boundary](#adr-63-service-hops-inside-the-stack-are-http-with-a-bearer-token-the-network-is-the-boundary)
+- [ADR 63 — Service hops inside the stack are plain HTTP; the network is the boundary](#adr-63-service-hops-inside-the-stack-are-plain-http-the-network-is-the-boundary)
 
 ## ADR 1. Keep the GitHub fork/PR/Action flow — it is the pedagogy
 
@@ -3731,23 +3731,29 @@ full list with the footer's line, as ADR 57 set out. A new page that shows its o
 `creditSponsors: false` the same way; the default keeps every other caller
 crediting them.
 
-## ADR 63. Service hops inside the stack are HTTP with a bearer token; the network is the boundary
+## ADR 63. Service hops inside the stack are plain HTTP; the network is the boundary
 
-**Context.** #476 wired the AWS scorer the way compose always had: sync posts
-scores to it and the app reads the leaderboard from it, over
-`http://scorer.<name>.internal:4000` with a bearer token. A review asked for
-TLS on that hop (CWE-319): anyone who could read the VPC's traffic could
-capture the token. The same is true of every other internal hop the kit has:
+**Context.** #476 wired the AWS scorer the way compose always had, over
+`http://scorer.<name>.internal:4000`: sync posts scores to it with a bearer
+token, and the app reads the leaderboard from it. A review asked for TLS on
+that hop (CWE-319): anyone who could read the VPC's traffic could capture
+the token. The same is true of every other internal hop the kit has:
 the app, sync and the scorer reach `srh` over `http://` with its bearer token,
 on compose, on Fly and on AWS alike. No decision had said so out loud.
 
-**Decision.** Traffic between the stack's own services stays plain HTTP, each
-hop authenticated with a bearer token, and the boundary is the network
+**Decision.** Traffic between the stack's own services stays plain HTTP, and
+the boundary is the network
 ([ADR 41](#adr-41-authenticating-redis-and-cutting-the-app-tier-off-from-it)):
 compose networks, the Fly machine's loopback, or AWS security groups that
 admit each hop from its one caller. The public edge is TLS (Caddy, Fly, the
 ALB with its ACM certificate), and ElastiCache is reached over TLS with AUTH,
 because that hop leaves our tasks for a managed service.
+
+- **Which hops carry a token.** Every `srh` hop carries `srh`'s bearer token,
+  and the scorer's one write, `POST /score` from sync, carries
+  `SCORER_TOKEN`. The scorer's read routes, `GET /leaderboard` and
+  `GET /challenges`, are open by contract (docs/scorer.md): the app reads
+  them with no token, and the network boundary alone keeps them internal.
 
 - **Why not TLS inside.** On AWS the tasks' ENIs sit in the event's own VPC,
   with nothing else in it; reading that traffic already takes a foothold in
@@ -3763,6 +3769,7 @@ because that hop leaves our tasks for a managed service.
   [#484](https://github.com/OWASP/owasp-ctf-in-a-box/issues/484) tracks doing it after the first event.
 
 **Consequences.** A review should not flag plaintext HTTP between the stack's
-own services as such. It should flag a new internal hop without a bearer
-token, a security-group rule wider than the one caller, and any internal
-hop exposed beyond the stack's network.
+own services as such, nor the scorer's open read routes. It should flag a new
+internal write or `srh` hop without a bearer token, a security-group rule
+wider than the one caller, and any internal hop exposed beyond the stack's
+network.
