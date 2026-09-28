@@ -51,7 +51,8 @@ output "next_steps" {
        decrypt grant names only this key, so a parameter stored under any
        other one fails at task start with an AccessDeniedException on KMS.
 
-         for s in BETTER_AUTH_SECRET GITHUB_CLIENT_SECRET GITHUB_TOKEN SRH_TOKEN; do
+         for s in BETTER_AUTH_SECRET GITHUB_CLIENT_SECRET SRH_TOKEN \
+                  GITHUB_APP_PRIVATE_KEY SCORER_TOKEN; do   # the last two: Secure Development only
            aws ssm put-parameter --region ${var.region} \
              --name "${var.ssm_prefix}/$s" --type SecureString \
              --key-id ${aws_kms_alias.secrets.name} \

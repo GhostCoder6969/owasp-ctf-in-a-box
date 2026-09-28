@@ -2,11 +2,12 @@
 #
 # Only two inputs have no default: domain and app_image.
 #
-# admin_logins is required too, through its validation block rather than
+# admin_logins and github_client_id are required too, through its validation block rather than
 # through a missing default: it defaults to "" so the refusal is a sentence
 # naming the problem instead of an interactive prompt in a non-interactive
-# plan, and a plan with no login in it is refused either way. github_org is
-# required on the same terms whenever enable_secure_development is true.
+# plan, and a plan with no login in it is refused either way. github_org and
+# github_app_id are required on the same terms whenever
+# enable_secure_development is true.
 # Everything else below is optional and shown at its default.
 
 region = "us-east-1"
@@ -60,6 +61,18 @@ acm_certificate_arn = ""
 # at plan time: it would forbid everyone from /admin, including you.
 admin_logins = "octocat,defunkt"
 
+# REQUIRED. The GitHub OAuth app's client id (public — the `.env`'s
+# GITHUB_CLIENT_ID). Its secret goes in SSM as GITHUB_CLIENT_SECRET. Without it
+# no one can sign in.
+github_client_id = "Iv1.0000000000000000"
+
+# The GitHub App sync polls with — the `.env`'s GITHUB_APP_ID and
+# GITHUB_APP_INSTALLATION_ID. The app id is REQUIRED whenever
+# enable_secure_development is true; the installation id is optional (sync
+# looks it up). The App's private key goes in SSM as GITHUB_APP_PRIVATE_KEY.
+# github_app_id              = "123456"
+# github_app_installation_id = ""
+
 # false for a quiz-only or classic-only event: no scorer, no sync, no GitHub.
 # Same rule as the compose profiles.
 # enable_secure_development = true
@@ -103,7 +116,8 @@ admin_logins = "octocat,defunkt"
 
 # SSM prefix holding the event's SecureStrings. Create these out of band before
 # the app starts — the README lists them:
-#   BETTER_AUTH_SECRET, GITHUB_CLIENT_SECRET, GITHUB_TOKEN, SRH_TOKEN
+#   BETTER_AUTH_SECRET, GITHUB_CLIENT_SECRET, SRH_TOKEN
+#   and, for Secure Development, GITHUB_APP_PRIVATE_KEY and SCORER_TOKEN
 # (REDIS_AUTH_TOKEN is generated and written there by Terraform.)
 # ssm_prefix = "/owasp-ctf"
 

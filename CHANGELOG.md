@@ -280,6 +280,26 @@ repo-level — `apps/web/package.json` tracks the current tag; `scorer` and
   padded to meet WCAG 2.5.8, the main nav is labelled "Site", and the landing
   page no longer credits its sponsors twice.
 
+- **The AWS module runs a current event (#476).** Its task definitions had
+  not kept up with poll scoring (#377) or with sync's move to a GitHub App, so
+  an applied stack could not sign anyone in, served the mock leaderboard,
+  refused team writes, and started neither sync nor the scorer.
+  - The app now gets `GITHUB_CLIENT_ID`, `LEADERBOARD_SOURCE=lambda`,
+    `TEAM_WRITES_ENABLED=true` and, on a Secure Development event,
+    `LEADERBOARD_API_URL`.
+  - sync gets the GitHub App's id, installation id and private key, the
+    scorer's URL and its bearer token. The scorer gets that token too.
+  - The scorer has a Cloud Map name and its own security group, reachable on
+    `:4000` from the app and sync only.
+  - `stack.tftest.hcl` now reads `docker-compose.yml` and fails if any
+    environment key compose gives the app, the scorer or sync is missing from
+    its ECS task.
+  - **Breaking for an existing `terraform.tfvars`:** `github_client_id` is now
+    required, and so is `github_app_id` when `enable_secure_development` is
+    true. In SSM, `GITHUB_TOKEN` is no longer read; store
+    `GITHUB_APP_PRIVATE_KEY` (base64 of the `.pem`) and `SCORER_TOKEN`
+    instead. `docs/aws.md` and the module README list the commands.
+
 ## v0.6.0 — 2026-09-20
 
 ### Breaking changes

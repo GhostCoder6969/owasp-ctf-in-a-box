@@ -114,13 +114,15 @@ mock_provider "random" {
 }
 
 variables {
-  domain          = "ctf.example.org"
-  route53_zone_id = "Z0123456789ABCDEFGHIJ"
-  app_image       = "123456789012.dkr.ecr.us-east-1.amazonaws.com/owasp-ctf-app:v1"
-  scorer_image    = "ghcr.io/example/scorer:v1"
-  sync_image      = "ghcr.io/example/sync:v1"
-  github_org      = "owasp-ctf-test"
-  admin_logins    = "octocat,defunkt"
+  github_client_id = "Iv1.0123456789abcdef"
+  github_app_id    = "123456"
+  domain           = "ctf.example.org"
+  route53_zone_id  = "Z0123456789ABCDEFGHIJ"
+  app_image        = "123456789012.dkr.ecr.us-east-1.amazonaws.com/owasp-ctf-app:v1"
+  scorer_image     = "ghcr.io/example/scorer:v1"
+  sync_image       = "ghcr.io/example/sync:v1"
+  github_org       = "owasp-ctf-test"
+  admin_logins     = "octocat,defunkt"
 }
 
 // --- the input contracts, each one refused at PLAN time --------------------
@@ -469,8 +471,8 @@ run "no_secret_is_baked_into_a_task_definition" {
   }
 
   assert {
-    condition     = alltrue([for s in local.worker_secrets : startswith(s.valueFrom, "arn:")])
-    error_message = "Every worker secret must be an SSM ARN reference, not a literal value."
+    condition     = alltrue([for s in concat(local.scorer_secrets, local.sync_secrets) : startswith(s.valueFrom, "arn:")])
+    error_message = "Every scorer and sync secret must be an SSM ARN reference, not a literal value."
   }
 
   assert {
@@ -645,5 +647,221 @@ run "the_app_is_pointed_at_srh_not_at_redis" {
   assert {
     condition     = !strcontains(aws_ecs_task_definition.app.container_definitions, "rediss://")
     error_message = "The app must never be handed a raw Redis URL — it speaks Upstash-REST only (ADR 41)."
+  }
+}
+
+// --- parity with docker-compose.yml (#476) ---------------------------------
+//
+// The module was written before poll scoring (#377) and before sync moved to
+// a GitHub App, and compose was updated for both while these task definitions
+// were not: the app lost sign-in (no GITHUB_CLIENT_ID), served the mock board
+// (no LEADERBOARD_SOURCE) and refused team writes; sync and the scorer
+// refused to start. Nothing here noticed, because every assertion named the
+// variables it already knew about.
+//
+// So the list is read from compose itself. Every environment key compose
+// gives app, scorer and sync must reach the matching ECS task as an
+// environment entry or a secret — a key added to compose and not here fails
+// this run. The exceptions are named, each with its reason.
+run "every_compose_variable_reaches_its_ecs_task" {
+  command = plan
+
+  variables {
+    enable_secure_development = true
+  }
+
+  assert {
+    condition = length(setsubtract(
+      setsubtract(keys(yamldecode(file("../../docker-compose.yml")).services.app.environment), [
+        // HTTPS is not optional here (the session cookie is Secure).
+        "ALLOW_INSECURE_EVENT_URL",
+        // The demo seed is a local-evaluation switch, never an event's.
+        "DEMO_MODE",
+      ]),
+      concat(
+        [for e in jsondecode(aws_ecs_task_definition.app.container_definitions)[0].environment : e.name],
+        [for e in jsondecode(aws_ecs_task_definition.app.container_definitions)[0].secrets : e.name],
+      ),
+    )) == 0
+    error_message = "Every environment key docker-compose.yml gives the app must reach the ECS app task (environment or secrets)."
+  }
+
+  assert {
+    condition = length(setsubtract(
+      keys(yamldecode(file("../../docker-compose.yml")).services.scorer.environment),
+      concat(
+        [for e in jsondecode(aws_ecs_task_definition.scorer[0].container_definitions)[0].environment : e.name],
+        [for e in jsondecode(aws_ecs_task_definition.scorer[0].container_definitions)[0].secrets : e.name],
+      ),
+    )) == 0
+    error_message = "Every environment key docker-compose.yml gives the scorer must reach the ECS scorer task."
+  }
+
+  assert {
+    condition = length(setsubtract(
+      setsubtract(keys(yamldecode(file("../../docker-compose.yml")).services.sync.environment), [
+        // Compose's value is sync's own default; the file lives in the
+        // task's ephemeral storage either way.
+        "STATE_PATH",
+      ]),
+      concat(
+        [for e in jsondecode(aws_ecs_task_definition.sync[0].container_definitions)[0].environment : e.name],
+        [for e in jsondecode(aws_ecs_task_definition.sync[0].container_definitions)[0].secrets : e.name],
+      ),
+    )) == 0
+    error_message = "Every environment key docker-compose.yml gives sync must reach the ECS sync task."
+  }
+}
+
+run "the_app_signs_in_scores_and_writes_teams" {
+  command = plan
+
+  variables {
+    enable_secure_development = true
+  }
+
+  assert {
+    condition = anytrue([
+      for e in jsondecode(aws_ecs_task_definition.app.container_definitions)[0].environment :
+      e.name == "GITHUB_CLIENT_ID" && e.value == var.github_client_id
+    ])
+    error_message = "The app needs GITHUB_CLIENT_ID, or GitHub sign-in gets an undefined client id (apps/web/src/lib/auth.ts)."
+  }
+
+  assert {
+    condition = anytrue([
+      for e in jsondecode(aws_ecs_task_definition.app.container_definitions)[0].environment :
+      e.name == "LEADERBOARD_SOURCE" && e.value == "lambda"
+    ])
+    error_message = "LEADERBOARD_SOURCE must be lambda: unset, the board serves mock fixture data (leaderboard/source.ts)."
+  }
+
+  assert {
+    condition = anytrue([
+      for e in jsondecode(aws_ecs_task_definition.app.container_definitions)[0].environment :
+      e.name == "LEADERBOARD_API_URL" && e.value == "http://scorer.${aws_service_discovery_private_dns_namespace.main.name}:4000"
+    ])
+    error_message = "The app reads scores and the challenge catalogue from the scorer by its Cloud Map name."
+  }
+
+  assert {
+    condition = anytrue([
+      for e in jsondecode(aws_ecs_task_definition.app.container_definitions)[0].environment :
+      e.name == "TEAM_WRITES_ENABLED" && e.value == "true"
+    ])
+    error_message = "TEAM_WRITES_ENABLED must be true, or no team can be created or joined (team-store.ts)."
+  }
+
+  assert {
+    condition = anytrue([
+      for e in jsondecode(aws_ecs_task_definition.sync[0].container_definitions)[0].environment :
+      e.name == "SCORER_URL" && e.value == "http://scorer.${aws_service_discovery_private_dns_namespace.main.name}:4000"
+    ])
+    error_message = "sync submits to the scorer by its Cloud Map name; the compose default http://scorer:4000 does not resolve on ECS."
+  }
+
+  assert {
+    condition     = length(aws_service_discovery_service.scorer) == 1
+    error_message = "The scorer needs a Cloud Map name, as srh has."
+  }
+}
+
+run "no_task_reads_the_retired_github_token" {
+  command = plan
+
+  variables {
+    enable_secure_development = true
+  }
+
+  assert {
+    condition = !anytrue(flatten([
+      for td in [aws_ecs_task_definition.app, aws_ecs_task_definition.scorer[0], aws_ecs_task_definition.sync[0]] : [
+        for e in concat(jsondecode(td.container_definitions)[0].environment, jsondecode(td.container_definitions)[0].secrets) :
+        e.name == "GITHUB_TOKEN"
+      ]
+    ]))
+    error_message = "Nothing reads GITHUB_TOKEN since sync moved to a GitHub App; a stray one is a PAT an operator stores for no reader."
+  }
+}
+
+// The scorer answers two callers, and only them: sync (POST /score) and the
+// app (the leaderboard and the challenge catalogue). It used to share the
+// worker group with sync, whose description is "nothing may reach them" —
+// a rule on that group would have let the scorer reach sync too.
+run "only_the_app_and_sync_may_reach_the_scorer" {
+  command = plan
+
+  variables {
+    enable_secure_development = true
+  }
+
+  assert {
+    condition     = aws_ecs_service.scorer[0].network_configuration[0].security_groups == toset([aws_security_group.scorer[0].id])
+    error_message = "The scorer runs in its own security group."
+  }
+
+  assert {
+    condition = (
+      aws_vpc_security_group_ingress_rule.scorer_from_app[0].referenced_security_group_id == aws_security_group.app.id &&
+      aws_vpc_security_group_ingress_rule.scorer_from_app[0].from_port == 4000 &&
+      aws_vpc_security_group_ingress_rule.scorer_from_app[0].to_port == 4000
+    )
+    error_message = "The app reaches the scorer on :4000."
+  }
+
+  assert {
+    condition = (
+      aws_vpc_security_group_ingress_rule.scorer_from_sync[0].referenced_security_group_id == aws_security_group.worker.id &&
+      aws_vpc_security_group_ingress_rule.scorer_from_sync[0].from_port == 4000 &&
+      aws_vpc_security_group_ingress_rule.scorer_from_sync[0].to_port == 4000
+    )
+    error_message = "sync reaches the scorer on :4000."
+  }
+
+  assert {
+    condition     = aws_vpc_security_group_ingress_rule.srh_from_scorer[0].referenced_security_group_id == aws_security_group.scorer[0].id
+    error_message = "The scorer still reaches srh from its own group."
+  }
+}
+
+run "a_blank_github_client_id_is_refused" {
+  command = plan
+
+  variables {
+    github_client_id = "  "
+  }
+
+  expect_failures = [var.github_client_id]
+}
+
+run "secure_development_without_a_github_app_id_is_refused" {
+  command = plan
+
+  variables {
+    enable_secure_development = true
+    github_app_id             = ""
+  }
+
+  expect_failures = [var.github_app_id]
+}
+
+run "a_quiz_only_event_points_the_app_at_no_scorer" {
+  command = plan
+
+  variables {
+    enable_secure_development = false
+  }
+
+  assert {
+    condition = !anytrue([
+      for e in jsondecode(aws_ecs_task_definition.app.container_definitions)[0].environment :
+      e.name == "LEADERBOARD_API_URL"
+    ])
+    error_message = "With no scorer running, the app must not be pointed at one."
+  }
+
+  assert {
+    condition     = length(aws_service_discovery_service.scorer) == 0 && length(aws_security_group.scorer) == 0
+    error_message = "A quiz-only event creates no scorer name and no scorer group."
   }
 }
