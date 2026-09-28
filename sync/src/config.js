@@ -22,7 +22,8 @@ function resolveAuth(env, apiUrl) {
     throw new Error("GITHUB_APP_PRIVATE_KEY must be base64-encoded PEM (a PEM private key)");
   }
   const installationId = env.GITHUB_APP_INSTALLATION_ID ? Number(env.GITHUB_APP_INSTALLATION_ID) : undefined;
-  const auth = makeAppAuth({ appId: env.GITHUB_APP_ID, privateKey, installationId, apiUrl });
+  // The org picks the installation when no id is set (appAuth.js).
+  const auth = makeAppAuth({ appId: env.GITHUB_APP_ID, privateKey, installationId, org: (env.GITHUB_ORG ?? "").trim(), apiUrl });
   return { authMode: "app", getToken: (fetchImpl) => auth.getToken(fetchImpl) };
 }
 

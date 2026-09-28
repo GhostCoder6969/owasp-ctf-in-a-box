@@ -98,7 +98,8 @@ Afterwards a redeploy is one command:
 ```
 
 Terraform creates the VPC (two AZs; a public tier for the ALB and tasks, a
-private tier for ElastiCache alone), the five security groups above, the
+private tier for ElastiCache alone), the security groups above (five, plus
+the scorer's own on a Secure Development event), the
 ElastiCache replication group with in-transit encryption and an AUTH token it
 generates for you, the ALB with its ACM certificate, the ECR repository, and the
 Fargate services for whichever modules this event runs — a quiz-only event

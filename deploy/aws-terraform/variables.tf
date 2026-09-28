@@ -169,7 +169,7 @@ variable "github_app_id" {
 }
 
 variable "github_app_installation_id" {
-  description = "The GitHub App's installation id on github_org. Optional: sync looks the installation up itself when it is empty."
+  description = "The GitHub App's installation id on github_org. Optional: when empty, sync picks the App's installation on github_org itself, and refuses to start polling if the App is not installed there."
   type        = string
   default     = ""
 }

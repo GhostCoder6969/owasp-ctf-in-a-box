@@ -17,10 +17,31 @@ export function mintAppJwt({ appId, privateKey, now = Date.now() }) {
 const GH_HEADERS = { accept: "application/vnd.github+json", "x-github-api-version": "2022-11-28" };
 const REFRESH_SKEW_MS = 5 * 60 * 1000;
 
+// The installation to poll with when none is configured. With an org, the one
+// installed on it (logins compare case-insensitively): an App installed on
+// several orgs used to hand back the FIRST one's token, which polls nothing
+// when that is not the event's org. With no org, a lone installation is
+// unambiguous and several are refused rather than guessed between.
+function pickInstallation(list, org) {
+  const logins = list.map((i) => i?.account?.login ?? "?").join(", ");
+  if (org) {
+    const want = org.toLowerCase();
+    const hit = list.find((i) => typeof i?.account?.login === "string" && i.account.login.toLowerCase() === want);
+    if (!hit) {
+      throw new Error(`GitHub App is not installed on ${org} (installed on: ${logins}); install it there, or set GITHUB_APP_INSTALLATION_ID`);
+    }
+    return hit.id;
+  }
+  if (list.length > 1) {
+    throw new Error(`GitHub App has ${list.length} installations (${logins}); set GITHUB_APP_INSTALLATION_ID to choose one`);
+  }
+  return list[0].id;
+}
+
 // Installation-token provider: mints an App JWT, exchanges it for an
 // installation token, caches it, and refreshes when near expiry. Pure/testable
 // via injected fetchImpl + now.
-export function makeAppAuth({ appId, privateKey, installationId, apiUrl = "https://api.github.com" }) {
+export function makeAppAuth({ appId, privateKey, installationId, org, apiUrl = "https://api.github.com" }) {
   let cache = null;      // { token, expiresAt(ms) }
   let instId = installationId;
 
@@ -36,8 +57,7 @@ export function makeAppAuth({ appId, privateKey, installationId, apiUrl = "https
     if (instId == null) {
       const list = await ghJson(`${apiUrl}/app/installations`, { fetchImpl, jwt, method: "GET" }, "listing app installations");
       if (!Array.isArray(list) || list.length === 0) throw new Error("GitHub App has no installations");
-      // First-wins: set GITHUB_APP_INSTALLATION_ID to disambiguate multi-org installs.
-      instId = list[0].id;
+      instId = pickInstallation(list, org);
     }
     const body = await ghJson(`${apiUrl}/app/installations/${instId}/access_tokens`, { fetchImpl, jwt, method: "POST" }, "minting installation token");
     const expiresAt = typeof body.expires_at === "string" ? new Date(body.expires_at).getTime() : NaN;

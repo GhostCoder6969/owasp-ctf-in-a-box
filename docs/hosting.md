@@ -942,7 +942,7 @@ the same list, annotated), and `doctor` flags a missing `REDIS_PASSWORD`.
 |---|---|---|---|
 | `GITHUB_ORG` | `sync` | required | The event org whose forked target repos are polled. `sync` refuses to start without it, logging `ctf-sync: GITHUB_ORG is not set` — for the poller a missing org is a misconfiguration, not "nothing to poll". Which targets inside the org are polled is a runtime `/admin` setting `sync` re-reads every tick. |
 | `GITHUB_APP_ID`, `GITHUB_APP_PRIVATE_KEY` | `sync` | required | The poll GitHub App; the key is base64-encoded PEM. `sync` refuses to start without both. |
-| `GITHUB_APP_INSTALLATION_ID` | `sync` | auto-discovered | Pin the installation when the App has more than one. |
+| `GITHUB_APP_INSTALLATION_ID` | `sync` | auto-discovered | Pin the installation. When unset, `sync` uses the App's installation on `GITHUB_ORG` and refuses one installed only elsewhere. |
 | `SCORER_TOKEN` | `sync`; `scorer` as `CTF_SCORE_BEARER_TOKEN` | required | Bearer token `sync` presents to `POST /score`. |
 | `SCORER_URL` | `sync` | *fixed*: `http://scorer:4000` | Where scores are submitted. |
 | `POLL_INTERVAL_MS` | `sync` | `30000` | *override*. Integer in `1..1789569705` (`floor((2^31-1)/1.2)`, headroom for the +20% jitter); anything else refuses at boot rather than tight-looping. |

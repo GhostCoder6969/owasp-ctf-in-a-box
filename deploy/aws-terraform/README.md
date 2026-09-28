@@ -313,5 +313,8 @@ Do it as a move, not an upgrade:
 6. **`terraform destroy` the old stack** from its own state directory.
 
 Secrets carry over unchanged if you keep the same `ssm_prefix` — except
-`REDIS_PASSWORD` and `SCORER_TOKEN`, which this module does not use, and
-`REDIS_AUTH_TOKEN`, which it creates for you.
+`REDIS_PASSWORD`, which this module does not use, and `REDIS_AUTH_TOKEN`,
+which it creates for you. A Secure Development event also needs
+`SCORER_TOKEN` (the scorer and sync share it) and `GITHUB_APP_PRIVATE_KEY`
+in SSM; create them as in the prerequisites if the old stack did not have
+them. `GITHUB_TOKEN` is no longer read.

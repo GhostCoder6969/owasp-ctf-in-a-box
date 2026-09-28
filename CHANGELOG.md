@@ -291,6 +291,10 @@ repo-level — `apps/web/package.json` tracks the current tag; `scorer` and
     scorer's URL and its bearer token. The scorer gets that token too.
   - The scorer has a Cloud Map name and its own security group, reachable on
     `:4000` from the app and sync only.
+  - On every deployment, not only AWS: when `GITHUB_APP_INSTALLATION_ID` is
+    unset, sync now uses the App's installation on `GITHUB_ORG`. It used to
+    take the first installation the App had, which polls nothing when that
+    is another org, and it now refuses an App installed only elsewhere.
   - `stack.tftest.hcl` now reads `docker-compose.yml` and fails if any
     environment key compose gives the app, the scorer or sync is missing from
     its ECS task.
