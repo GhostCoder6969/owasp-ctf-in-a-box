@@ -31,7 +31,8 @@ describe("parseBundle", () => {
   });
 
   it("rejects an unknown version rather than misparsing it", () => {
-    const res = parseBundle(JSON.stringify({ ...valid, version: 2 }));
+    // 2 is a real version since #463 (stories); 3 is not.
+    const res = parseBundle(JSON.stringify({ ...valid, version: 3 }));
     expect(res.ok).toBe(false);
     if (res.ok) throw new Error("unreachable");
     expect(res.errors.some((e) => e.where === "version")).toBe(true);
@@ -124,5 +125,67 @@ describe("caseSensitive in a bundle", () => {
   it("still accepts a bundle exported before the field existed", () => {
     // The contract of a versioned bundle: an older export must keep importing.
     expect(parseBundle(withFirstChallenge({})).ok).toBe(true);
+  });
+});
+
+describe("bundle v2: stories (#463)", () => {
+  const ids = valid.challenges.map((c) => c.id);
+  const v2 = (stories: unknown) => JSON.stringify({ ...valid, version: 2, stories });
+
+  it("accepts a v2 bundle with stories, and a v1 bundle without", () => {
+    const res = parseBundle(v2([{ id: "op", title: "Op", intro: "Go.", steps: ids }]));
+    if (!res.ok) throw new Error(JSON.stringify(res.errors));
+    expect(res.bundle.stories).toEqual([{ id: "op", title: "Op", intro: "Go.", steps: ids }]);
+    expect(parseBundle(JSON.stringify(valid)).ok).toBe(true);
+  });
+
+  // The store's caps, enforced HERE too: an event-archive import resets and
+  // clears the box before its classic section reaches setStories' checks, so
+  // a cap the parser misses turns into a wiped box and a failed import.
+  it("enforces the store's story caps: count, steps, title and intro length", () => {
+    const one = (over: Record<string, unknown>) => ({ id: "op", title: "Op", intro: "", steps: [ids[0]], ...over });
+    const many = Array.from({ length: 51 }, (_, i) => ({ id: `s${i}`, title: "T", intro: "", steps: [] }));
+    expect(parseBundle(v2(many)).ok).toBe(false);
+    expect(parseBundle(v2(many.slice(0, 50))).ok).toBe(true);
+    expect(parseBundle(v2([one({ title: "x".repeat(121) })])).ok).toBe(false);
+    expect(parseBundle(v2([one({ title: "x".repeat(120) })])).ok).toBe(true);
+    expect(parseBundle(v2([one({ intro: "x".repeat(2001) })])).ok).toBe(false);
+    expect(parseBundle(v2([one({ intro: "x".repeat(2000) })])).ok).toBe(true);
+    // 65 steps: the step-count cap, not the unknown-id rule, must be what refuses.
+    const bigIds = Array.from({ length: 65 }, (_, i) => `c${i}-aa11aa`);
+    const big = (n: number) =>
+      JSON.stringify({
+        version: 2,
+        categories: ["Web"],
+        challenges: bigIds.slice(0, n).map((id, i) => ({ ...valid.challenges[0], id, order: i })),
+        stories: [{ id: "op", title: "Op", intro: "", steps: bigIds.slice(0, n) }],
+      });
+    expect(parseBundle(big(64)).ok).toBe(true);
+    const over = parseBundle(big(65));
+    expect(over.ok).toBe(false);
+    expect(!over.ok && over.errors.some((e) => /at most 64 steps/.test(e.message))).toBe(true);
+  });
+
+  it("refuses stories on a v1 bundle (a hand edit that forgot the bump would drop the lock silently)", () => {
+    const res = parseBundle(JSON.stringify({ ...valid, stories: [] }));
+    expect(res.ok).toBe(false);
+  });
+
+  it("reports every story problem in one pass", () => {
+    const res = parseBundle(
+      v2([
+        { id: "op", title: "", intro: "", steps: [ids[0], ids[0], "not-in-bundle-zz99zz"] },
+        { id: "op", title: "Dup id", intro: "", steps: [] },
+        { id: "side", title: "Side", intro: "", steps: [ids[0]] },
+      ]),
+    );
+    expect(res.ok).toBe(false);
+    if (res.ok) throw new Error("unreachable");
+    const text = JSON.stringify(res.errors);
+    expect(text).toMatch(/title/);
+    expect(text).toMatch(/twice/);
+    expect(text).toMatch(/not-in-bundle-zz99zz/);
+    expect(text).toMatch(/unique/);
+    expect(text).toMatch(/two stories|one story/);
   });
 });

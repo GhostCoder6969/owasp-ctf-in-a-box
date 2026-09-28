@@ -17,7 +17,22 @@ repo-level — `apps/web/package.json` tracks the current tag; `scorer` and
     before reading any secret. A locked step costs nothing and is answered
     exactly like an unknown challenge.
   - A locked step's page, metadata and board-items entry reveal nothing.
-  - The authoring UI and the bundle come next. See ADR 60.
+  - See ADR 60.
+
+- **Authoring stories, and bundle v2 (#463, part 2).**
+  - A **Stories** block on the Jeopardy tab creates stories, orders their
+    steps with ↑ / ↓, and saves the whole list in one request. The server
+    refuses a step that names a missing challenge, and a challenge placed in
+    two stories.
+  - Challenge bundles are now **version 2** and carry a `stories` list.
+    Import merges the stories by id, and a merge that would put one
+    challenge in two stories refuses the whole file. Version 1 files still
+    import unchanged.
+  - **Breaking for older boxes:** an export from this version is stamped
+    `"version": 2`, which a box running an earlier release refuses (it
+    accepts only version 1). Export from the newer box only into a box on
+    this release or later; a hand-made version 1 file (no `stories`) still
+    imports everywhere.
 
 - **A Launch block in `/admin`.** The Event tab now shows **Not launched**,
   **Scheduled for …** or **Live since …**.

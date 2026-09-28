@@ -19,6 +19,10 @@ import {
   CLASSIC_FLAGNORM_KEY as FLAGNORM_KEY,
   CLASSIC_CATEGORIES_KEY as CATEGORIES_KEY,
   CLASSIC_STORIES_KEY,
+  CLASSIC_STORIES_MAX,
+  CLASSIC_STORY_INTRO_MAX,
+  CLASSIC_STORY_STEPS_MAX,
+  CLASSIC_STORY_TITLE_MAX,
   CLASSIC_POINTS_KEY as POINTS_KEY,
   CLASSIC_SOLVED_KEY as SOLVED_KEY,
   CLASSIC_SOLVECOUNT_KEY as SOLVECOUNT_KEY,
@@ -503,7 +507,9 @@ export async function upsertChallenge(c: Challenge, flag: string, hint?: string 
  *  on the board, and how many categories the bundle itself carried (its own
  *  scope, not the post-union total — an organizer reading this back wants to
  *  know what THEY just submitted). */
-export type ImportSummary = { created: number; updated: number; categories: number };
+/** `stories` is present only for a bundle that carried them (v2): the count
+ *  of stories the bundle upserted, not the size of the merged list. */
+export type ImportSummary = { created: number; updated: number; categories: number; stories?: number };
 
 /** Applies a PRE-VALIDATED bundle (produced by `classic-io.ts`'s
  *  `parseBundle`) to the store: upserts every challenge it contains and
@@ -540,9 +546,12 @@ export type ImportSummary = { created: number; updated: number; categories: numb
  *  pipeline call, exactly like `upsertChallenge` reads `listCategories()`
  *  before its own write. */
 export async function importBundle(bundle: ClassicBundle): Promise<ImportSummary> {
-  const [idsRes, categoriesRes] = await upstashPipeline([
+  // A v2 bundle's stories merge into the stored list, so that list is read
+  // with the rest; a v1 bundle (no `stories`) never touches it (#463).
+  const [idsRes, categoriesRes, storiesRes] = await upstashPipeline([
     ["HKEYS", CHALLENGES_KEY],
     ["GET", CATEGORIES_KEY],
+    ...(bundle.stories ? [["GET", CLASSIC_STORIES_KEY]] : []),
   ]);
 
   // Both reads must have succeeded before anything is written. A failed GET
@@ -551,8 +560,25 @@ export async function importBundle(bundle: ClassicBundle): Promise<ImportSummary
   // bundle's — and re-spell every stored challenge's category to the bundle's
   // casing, hiding them from the board's exact-match filter. A failed HKEYS
   // would report every row `created`. Same guard as ai-store's (#260, #261).
-  const failedRead = [idsRes, categoriesRes].find((r) => r.error);
+  const failedRead = [idsRes, categoriesRes, storiesRes].find((r) => r?.error);
   if (failedRead) throw new Error(`Upstash read failed before import: ${failedRead.error}`);
+
+  // Upsert by id, like the challenges: a bundle story replaces the stored one
+  // with its id in place, a new one is appended, and a stored story the bundle
+  // does not mention is kept. The MERGED list is validated here, before any
+  // write — a challenge that lands in two stories refuses the whole import,
+  // never half of it. A corrupt stored value throws too (parseStoredStories),
+  // rather than being overwritten by the bundle's.
+  let mergedStories: Story[] | null = null;
+  if (bundle.stories) {
+    const merged = parseStoredStories(storiesRes?.result);
+    for (const st of bundle.stories) {
+      const at = merged.findIndex((m) => m.id === st.id);
+      if (at >= 0) merged[at] = st;
+      else merged.push(st);
+    }
+    mergedStories = canonicalStories(merged);
+  }
 
   const existingIds = new Set(Array.isArray(idsRes.result) ? (idsRes.result as string[]) : []);
 
@@ -627,12 +653,13 @@ export async function importBundle(bundle: ClassicBundle): Promise<ImportSummary
     commands.push(["HSET", FLAGNORM_KEY, c.id, flagComparisonForm(c.flag, record.caseSensitive)]);
   }
   commands.push(["SET", CATEGORIES_KEY, JSON.stringify(unioned)]);
+  if (mergedStories) commands.push(["SET", CLASSIC_STORIES_KEY, JSON.stringify(mergedStories)]);
 
   const results = await upstashPipeline(commands);
   const failed = results.find((r) => r.error);
   if (failed) throw new Error(`Upstash bulk import failed: ${failed.error}`);
 
-  return { created, updated, categories: bundle.categories.length };
+  return { created, updated, categories: bundle.categories.length, ...(bundle.stories ? { stories: bundle.stories.length } : {}) };
 }
 
 /** The current board, in the same shape `importBundle` accepts — so
@@ -643,7 +670,7 @@ export async function importBundle(bundle: ClassicBundle): Promise<ImportSummary
  *  comes back with its flag alongside the public fields, matching
  *  `ClassicBundleChallenge`. */
 export async function exportBundle(): Promise<ClassicBundle> {
-  const [rows, categories] = await Promise.all([listChallengesForAdmin(), listCategories()]);
+  const [rows, categories, stories] = await Promise.all([listChallengesForAdmin(), listCategories(), listStories()]);
   const challenges: ClassicBundleChallenge[] = rows.map(({ challenge, flag, hint }) => ({
     id: challenge.id,
     title: challenge.title,
@@ -661,7 +688,13 @@ export async function exportBundle(): Promise<ClassicBundle> {
     // byte-identically to a pre-#190 one.
     ...(hint ? { hint } : {}),
   }));
-  return { version: CLASSIC_BUNDLE_VERSION, categories, challenges };
+  // A stored step can outlive its challenge (deleteChallenge updates the story
+  // in a second call; read paths already drop such a step via storyPositions).
+  // parseBundle refuses a step not in the file, so an export that kept one
+  // would be a backup that does not restore — prune to the exported ids.
+  const exported = new Set(challenges.map((c) => c.id));
+  const kept = stories.map((st) => ({ ...st, steps: st.steps.filter((step) => exported.has(step)) }));
+  return { version: CLASSIC_BUNDLE_VERSION, categories, challenges, stories: kept };
 }
 
 /** Removes a challenge and both of its flag rows together — nothing else.
@@ -1252,10 +1285,7 @@ export async function submitFlag(
 // Stored like the category list: one JSON value. The lock itself is derived
 // (lib/story-lock.ts), never stored.
 
-export const CLASSIC_STORIES_MAX = 50;
-export const CLASSIC_STORY_STEPS_MAX = 64;
-export const CLASSIC_STORY_TITLE_MAX = 120;
-export const CLASSIC_STORY_INTRO_MAX = 2000;
+export { CLASSIC_STORIES_MAX, CLASSIC_STORY_STEPS_MAX, CLASSIC_STORY_TITLE_MAX, CLASSIC_STORY_INTRO_MAX };
 const STORY_ID_RE = /^[a-z0-9][a-z0-9-]{0,63}$/;
 
 function parseStoredStories(raw: unknown): Story[] {
@@ -1292,6 +1322,15 @@ export async function listStories(): Promise<Story[]> {
  *  ids are checked for shape here and for existence by the authoring route.
  *  Returns what was stored. */
 export async function setStories(stories: Story[]): Promise<Story[]> {
+  const canonical = canonicalStories(stories);
+  const [res] = await upstashPipeline([["SET", CLASSIC_STORIES_KEY, JSON.stringify(canonical)]]);
+  if (res.error) throw new Error(`Upstash SET failed: ${res.error}`);
+  return canonical;
+}
+
+/** `setStories`'s validation, pure, so `importBundle` can run it on the
+ *  merged list before its write pipeline. THROWS `ClassicValidationError`. */
+function canonicalStories(stories: Story[]): Story[] {
   if (!Array.isArray(stories)) throw new ClassicValidationError("stories", "stories must be an array");
   if (stories.length > CLASSIC_STORIES_MAX) {
     throw new ClassicValidationError("stories", `At most ${CLASSIC_STORIES_MAX} stories are allowed`);
@@ -1328,8 +1367,6 @@ export async function setStories(stories: Story[]): Promise<Story[]> {
     }
     canonical.push({ id, title, intro, steps: [...st.steps] });
   }
-  const [res] = await upstashPipeline([["SET", CLASSIC_STORIES_KEY, JSON.stringify(canonical)]]);
-  if (res.error) throw new Error(`Upstash SET failed: ${res.error}`);
   return canonical;
 }
 

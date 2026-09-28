@@ -284,7 +284,8 @@ authoring/retry-knob guide), `classic` (a jeopardy-style flag board,
 also scored entirely inside the app — see
 [docs/architecture.md#jeopardy-data-flow](architecture.md#jeopardy-data-flow)
 for its data flow and `docs/operations.md`'s "Jeopardy" section for the
-organizer-facing authoring/cooldown guide), and `ai` (challenges hosted on an
+organizer-facing authoring/cooldown guide, including stories — chains of
+challenges a team unlocks in order, #463), and `ai` (challenges hosted on an
 external site, played there or graded by a typed flag back on `/ai/[id]`).
 Registered and selectable, and its contract, store layer, contestant surface
 **and** admin section have all shipped: the nav entry, the `/ai` board and
@@ -445,8 +446,10 @@ third module isn't mistaken for a fully general n-module platform:
     (label, points and id) in `/api/board/items`.
   - **Fails closed.** A stories read that fails errors the request instead of
     guessing.
-  - **Authoring** (the `/admin` editor and the bundle) arrives with #463's
-    second PR.
+  - **Authoring.** The `/admin` Jeopardy tab has a Stories editor
+    (`POST /api/admin/classic` with exactly `{ stories }`). Bundles carry
+    stories as version 2 and merge them by id on import. See
+    `docs/operations.md`'s "Jeopardy" section.
 - **`classic` HAS paid hints (issue #190).** An organizer attaches optional
   hint text in the admin classic form (or a bundle's `hint` field); the text
   is secret until purchased — its own hash, `ctf:classic:hints`, exactly the
