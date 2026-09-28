@@ -208,7 +208,7 @@ export const DEMO_CHALLENGES: DemoChallenge[] = [
       "- GPS coordinates\n" +
       "- Software field\n" +
       "- Comment field\n\n" +
-      "`exiftool` is your friend here.",
+      "`exiftool` is your friend here. Submit what you find wrapped in this board's flag format.",
     flag: "ctfbox{Exif_Never_Forgets}",
   },
   {
@@ -222,7 +222,7 @@ export const DEMO_CHALLENGES: DemoChallenge[] = [
       "```\n" +
       'tcp.port == 21 && ftp.request.command == "PASS"\n' +
       "```\n\n" +
-      "*FTP never learned to keep a secret.*",
+      "*FTP never learned to keep a secret.* Submit the password wrapped in this board's flag format.",
     flag: "ctfbox{Plaintext_Ftp_Strikes_Again}",
   },
   {
@@ -255,6 +255,45 @@ export const DEMO_CHALLENGES: DemoChallenge[] = [
 ];
 
 export type DemoClassicSolve = { login: string; challengeId: string };
+
+/** #186: tiny synthetic artifacts, so the two forensics challenges ship the
+ *  file they ask about instead of pretending. Made for this kit (nothing
+ *  captured or photographed): a one-packet pcap whose FTP PASS carries the
+ *  secret, and a 1x1 JPEG whose comment segment does. Seeded through the
+ *  attachments store, so they sit behind the same locks as any upload.
+ *
+ *  Each carries the secret UNWRAPPED, and the challenge text says to wrap it
+ *  in the board's flag format without naming the prefix (no public record may
+ *  carry it; see the seed test "NO flag in the public record"). So the stored
+ *  flag never sits in a file a contestant can download (the secrecy boundary,
+ *  docs/reviewing.md); admin-store.seed.test.ts decodes both and pins that. */
+export type DemoClassicAttachment = { challengeId: string; name: string; base64: string };
+
+export const DEMO_CLASSIC_ATTACHMENTS: DemoClassicAttachment[] = [
+  {
+    challengeId: "forensics-packet-peek",
+    name: "capture.pcap",
+    base64:
+    "1MOyoQIABAAAAAAAAAAAAP//AAABAAAAgDuxagAAAABYAAAAWAAAAAIAAAAAIQIAAAAAIwgARQAASgAAAABABmaDCgAAFwoAABXA" +
+    "AAAVAAAAAQAAAAFQGPrwpnEAAFBBU1MgUGxhaW50ZXh0X0Z0cF9TdHJpa2VzX0FnYWluDQo=",
+  },
+  {
+    challengeId: "forensics-metadata-leak",
+    name: "photo.jpg",
+    base64:
+    "/9j//gAdQ29tbWVudDogRXhpZl9OZXZlcl9Gb3JnZXRz/+AAEEpGSUYAAQEAAEgASAAA/+EATEV4aWYAAE1NACoAAAAIAAGHaQAE" +
+    "AAAAAQAAABoAAAAAAAOgAQADAAAAAQABAACgAgAEAAAAAQAAAAGgAwAEAAAAAQAAAAEAAAAA/+0AOFBob3Rvc2hvcCAzLjAAOEJJ" +
+    "TQQEAAAAAAAAOEJJTQQlAAAAAAAQ1B2M2Y8AsgTpgAmY7PhCfv/AABEIAAEAAQMBIgACEQEDEQH/xAAfAAABBQEBAQEBAQAAAAAA" +
+    "AAAAAQIDBAUGBwgJCgv/xAC1EAACAQMDAgQDBQUEBAAAAX0BAgMABBEFEiExQQYTUWEHInEUMoGRoQgjQrHBFVLR8CQzYnKCCQoW" +
+    "FxgZGiUmJygpKjQ1Njc4OTpDREVGR0hJSlNUVVZXWFlaY2RlZmdoaWpzdHV2d3h5eoOEhYaHiImKkpOUlZaXmJmaoqOkpaanqKmq" +
+    "srO0tba3uLm6wsPExcbHyMnK0tPU1dbX2Nna4eLj5OXm5+jp6vHy8/T19vf4+fr/xAAfAQADAQEBAQEBAQEBAAAAAAAAAQIDBAUG" +
+    "BwgJCgv/xAC1EQACAQIEBAMEBwUEBAABAncAAQIDEQQFITEGEkFRB2FxEyIygQgUQpGhscEJIzNS8BVictEKFiQ04SXxFxgZGiYn" +
+    "KCkqNTY3ODk6Q0RFRkdISUpTVFVWV1hZWmNkZWZnaGlqc3R1dnd4eXqCg4SFhoeIiYqSk5SVlpeYmZqio6Slpqeoqaqys7S1tre4" +
+    "ubrCw8TFxsfIycrS09TV1tfY2dri4+Tl5ufo6ery8/T19vf4+fr/2wBDAAICAgICAgMCAgMFAwMDBQYFBQUFBggGBgYGBggKCAgI" +
+    "CAgICgoKCgoKCgoMDAwMDAwODg4ODg8PDw8PDw8PDw//2wBDAQICAgQEBAcEBAcQCwkLEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQ" +
+    "EBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBD/3QAEAAH/2gAMAwEAAhEDEQA/ANSiiiv0w/y7P//Z",
+  },
+];
 
 // Spread across several demo contestants (and across both members of more
 // than one team) so the classic board's contribution to the combined

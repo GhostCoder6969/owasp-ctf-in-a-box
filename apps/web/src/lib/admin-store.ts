@@ -2,6 +2,7 @@ import "server-only";
 import { createHash } from "node:crypto";
 import { assertPipelineOk, parseScanPage, upstashEval, upstashPipeline } from "@/lib/upstash";
 import { ADMIN_ADMINS_KEY, LOGIN_RE } from "@/lib/admin-admins";
+import { addUpload, fillMissingUpload, listAttachments } from "@/lib/attachments-store";
 import { TEAM_MAX_MEMBERS_MAX } from "@/lib/team-limits";
 import { SCORE_COOLDOWN_MIN_MAX } from "@/lib/scoring-defaults";
 import {
@@ -28,6 +29,7 @@ import {
   DEMO_CHALLENGES,
   DEMO_CLASSIC_CATEGORIES,
   DEMO_CLASSIC_SOLVES,
+  DEMO_CLASSIC_ATTACHMENTS,
   DEMO_AI_CHALLENGES,
   DEMO_AI_CATEGORIES,
   DEMO_AI_SOLVES,
@@ -1056,6 +1058,19 @@ function raiseSolveCounts(cmds: (string | number)[][], key: string, counts: Map<
  * does not clear first. Gated by the route on DEMO_MODE + requireAdmin;
  * never a production path.
  */
+async function seedDemoAttachments(): Promise<void> {
+  for (const a of DEMO_CLASSIC_ATTACHMENTS) {
+    const bytes = new Uint8Array(Buffer.from(a.base64, "base64"));
+    const sha = createHash("sha256").update(bytes).digest("hex");
+    const stored = await listAttachments("classic", a.challengeId);
+    const match = stored.find((s) => s.kind === "upload" && s.sha256 === sha);
+    // Present with its bytes: nothing to do. Present but MISSING (an imported
+    // bundle carries metadata only): the right sha and no bytes, so fill it.
+    if (match?.missing) await fillMissingUpload(match.id, bytes);
+    else if (!match) await addUpload("classic", a.challengeId, a.name, bytes);
+  }
+}
+
 export async function seedDemoData(
   actor: string,
 ): Promise<{ contestants: number; teams: number; solves: number; sponsors: number }> {
@@ -1459,6 +1474,13 @@ export async function seedDemoData(
   if (failed) throw new Error(`Seed failed: ${failed.error}`);
   const auditFailed = results.slice(cleanupCommandCount).find((r) => r.error);
   if (auditFailed) console.error("[admin] seed audit write failed:", adminErrorLabel(new Error(auditFailed.error)));
+  // #186: the forensics challenges' artifacts, through the attachments store
+  // (so the caps and locks apply). Keyed by sha256 — a re-seed adds nothing.
+  if (classicEnabled) {
+    // After the seed landed: a failure here is logged, like the audit write
+    // above — the demo is seeded, only its forensics files are not.
+    await seedDemoAttachments().catch((err) => console.error("[admin] demo attachments failed:", adminErrorLabel(err)));
+  }
   return {
     contestants: DEMO_CONTESTANTS.length,
     teams: DEMO_TEAMS.length,
