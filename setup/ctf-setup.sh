@@ -23,6 +23,11 @@
 #             `# ctf-workflow-version:` stamp — how a fix to ctf-score.yml
 #             reaches an event that is ALREADY provisioned (`org` does this
 #             too, but also re-mirrors the scorer image)
+#   private   set each DETACHED fork private while the event is not launched
+#             (#465; `org` runs this too — re-run it after detaching)
+#   launch    launch-day for Secure Development: check every fork is detached
+#             and the scorer package private, flip every fork PUBLIC, then
+#             wait for Launch in /admin (polls EVENT_URL/health/deep)
 #   teardown  archive event repos after the event
 #   doctor    read-only status check: verify a previously-provisioned org
 #             matches targets.tsv (no mutation, no --dry-run needed)
@@ -130,6 +135,28 @@ STEPS="fork ctf-branch drop-old protect workflow disable-inherited pr-template v
 fork_detached() { [ "$(gh api "repos/$1" --jq '.fork' 2>/dev/null)" = "false" ]; }
 package_private() { [ "$(gh api "orgs/$1/packages/container/score" --jq '.visibility' 2>/dev/null)" = "private" ]; }
 
+# #465: a fork's visibility ("public"/"private"; empty on a gh error — the
+# caller treats that as unknown, never as either answer) and the flip.
+fork_visibility() { gh api "repos/$1" --jq '.visibility' 2>/dev/null; }
+set_fork_visibility() { gh api -X PATCH "repos/$1" -f "visibility=$2" >/dev/null 2>&1; }
+
+# The box's launch state from its public /health/deep (#464): echoes
+# `launched`, `not-launched`, or `unknown` (no EVENT_URL, no answer, or the
+# box could not read its own settings). No -f: a degraded box answers 503
+# and that body still carries `launched`. Never called under --dry-run.
+box_launch_state() {
+  local url deep
+  url="$(env_val EVENT_URL)"; url="${url%/}"
+  [ -n "$url" ] || { echo unknown; return 0; }
+  deep="$(curl -sS --max-time 5 "$url/health/deep" 2>/dev/null)" || { echo unknown; return 0; }
+  deep="$(printf '%s' "$deep" | tr -d ' ')"
+  case "$deep" in
+    *'"launched":true'*) echo launched ;;
+    *'"launched":false'*) echo not-launched ;;
+    *) echo unknown ;;
+  esac
+}
+
 # The per-fork package Read grant has no API to read back — but it has an
 # OBSERVABLE consequence, which is nearly as good and a great deal better than
 # the bare reminder this replaced: the fork's own scoring workflow either
@@ -144,9 +171,14 @@ package_private() { [ "$(gh api "orgs/$1/packages/container/score" --jq '.visibi
 #            the pull happened inside "Run scorer" and cannot be observed
 #            separately). `unknown` therefore does NOT mean the grant is
 #            missing, and the doctor line must not say it does.
+#   error    GitHub did not answer (the runs or a run's jobs could not be
+#            read), so nothing was observed. Distinct from `unknown` because
+#            `launch` must refuse on it (#477 review): "no run yet" is a fact
+#            about the fork, "could not ask" is not. doctor, advisory, shows
+#            both as unverified.
 #
 # FAILS CLOSED, like every check_step: an API error, an unreadable reply, or
-# anything unrecognized reports `unknown`, never `granted`. Reporting a grant
+# anything unrecognized reports `error` or `unknown`, never `granted`. Reporting a grant
 # that was never observed is the one answer that would make this worse than
 # the reminder.
 #
@@ -154,15 +186,15 @@ package_private() { [ "$(gh api "orgs/$1/packages/container/score" --jq '.visibi
 # back, so an old refusal under a recent success is history rather than news —
 # hence first-success-wins over first-failure-wins in the loop below.
 pull_grant_status() {
-  slug="$1"; runs=""; jobs=""; step=""
+  slug="$1"; runs=""; jobs=""; step=""; unread=0
 
   runs="$(gh api "repos/$slug/actions/workflows/ctf-score.yml/runs?per_page=5" \
-    --jq '.workflow_runs[].id' 2>/dev/null)" || { echo unknown; return 0; }
+    --jq '.workflow_runs[].id' 2>/dev/null)" || { echo error; return 0; }
   [ -n "$runs" ] || { echo unknown; return 0; }
 
   for run in $runs; do
     jobs="$(gh api "repos/$slug/actions/runs/$run/jobs" \
-      --jq '.jobs[].steps[] | select(.name == "Pull scorer image") | .conclusion' 2>/dev/null)" || continue
+      --jq '.jobs[].steps[] | select(.name == "Pull scorer image") | .conclusion' 2>/dev/null)" || { unread=1; continue; }
     for step in $jobs; do
       case "$step" in
         success) echo granted; return 0 ;;
@@ -172,7 +204,7 @@ pull_grant_status() {
     done
   done
 
-  echo unknown
+  if [ "$unread" -eq 1 ]; then echo error; else echo unknown; fi
 }
 
 # --- scoring-workflow versioning ------------------------------------------
@@ -352,7 +384,7 @@ do_step() {
 cmd_doctor() {
   require_env_file
   local org; org="$(env_val GITHUB_ORG)"
-  local rc=0 t id cell name want_v have
+  local rc=0 t id cell name want_v have vis
 
   # Check (a) — ADMIN_LOGINS (issue #382). Always checked, regardless of
   # Secure Development: an event with no admins is broken either way, and the
@@ -439,6 +471,9 @@ cmd_doctor() {
   # the normal state before kickoff, and an unreachable one is named once,
   # neutrally — doctor is not a monitor.
   local event_url; event_url="$(env_val EVENT_URL)"
+  # Kept for the fork-visibility check below (#465): launched | not-launched
+  # | unknown. Unknown judges nothing.
+  local doctor_launch=unknown
   if [ -n "$event_url" ] && [ "$DRY_RUN" -eq 1 ]; then
     printf 'DRY-RUN: would read the launch state from %s/health/deep\n\n' "${event_url%/}"
   elif [ -n "$event_url" ]; then
@@ -451,10 +486,11 @@ cmd_doctor() {
       deep_compact="$(printf '%s' "$deep" | tr -d ' ')"
       case "$deep_compact" in
         *'"launched":false'*)
+          doctor_launch=not-launched
           printf '%s⚠️  %s is not launched — contestants see the landing page only and nothing scores.%s\n' "$C_YELLOW" "$event_url" "$C_RESET"
           printf '    When you are ready: press Launch in /admin → Event (or set Scoring opens).\n\n'
           ;;
-        *'"launched":true'*) ;;
+        *'"launched":true'*) doctor_launch=launched ;;
         *)
           printf 'ℹ️  could not read the launch state from %s/health/deep (the box could not read its settings).\n\n' "${event_url%/}"
           ;;
@@ -522,6 +558,27 @@ cmd_doctor() {
   echo "legend: fork=forked ctf=ctf-branch old=drop-old prot=protected wkfl=workflow"
   echo "        disI=disable-inherited pr=pr-template vapp=vapp-dockerfile detch=fork-detached (–=n/a)"
   echo "❌ = automatable step missing (fails exit); ⚠️ = UI-only step to finish by hand"
+
+  # Fork visibility against the launch (#465): private until launch, public
+  # after. Advisory — the organizer's launch-day sequence fixes both — and
+  # silent while the launch state is unknown.
+  if [ "$doctor_launch" != unknown ]; then
+    local vis_note=0
+    for t in $(all_targets); do
+      name="$(prov_repo_name "$t")"
+      vis="$(fork_visibility "$org/$name")" || vis=""
+      if [ "$doctor_launch" = not-launched ] && [ "$vis" = public ]; then
+        [ "$vis_note" -eq 1 ] || echo; vis_note=1
+        printf '%s⚠️  %s is public before launch — contestants can see its ctf branch; detach it and run '"'"'ctf-setup.sh private'"'"'.%s\n' "$C_YELLOW" "$name" "$C_RESET"
+      elif [ -z "$vis" ]; then
+        [ "$vis_note" -eq 1 ] || echo; vis_note=1
+        printf 'ℹ️  could not read %s'"'"'s visibility (GitHub did not answer).\n' "$name"
+      elif [ "$doctor_launch" = launched ] && [ "$vis" = private ]; then
+        [ "$vis_note" -eq 1 ] || echo; vis_note=1
+        printf '%s⚠️  %s is still private after launch — contestants cannot fork it; run '"'"'ctf-setup.sh launch'"'"'.%s\n' "$C_YELLOW" "$name" "$C_RESET"
+      fi
+    done
+  fi
 
   # Org-level (not per-target): scorer package.
   echo
@@ -1015,15 +1072,220 @@ cmd_org() {
 
   mirror_image "$org" "$src"
 
+  # Forks stay private until launch (#465). A fork still in its fork network
+  # cannot be made private, so this skips it by name — re-run
+  # `ctf-setup.sh private` after the detach below.
+  privatize_forks "$org" || echo "   (fork visibility: see the errors above; re-run 'ctf-setup.sh private')"
+
   cat <<EOF
 == manual steps (GitHub UI, no API) — run 'ctf-setup doctor' to re-check:
-   1. Detach each fork from its fork network (repo Settings -> Leave fork network).
+   1. Detach each fork from its fork network (repo Settings -> Leave fork network),
+      then run 'ctf-setup.sh private': forks stay private until 'ctf-setup.sh launch'.
+      A private repo in a free org uses the org's limited Actions minutes —
+      plenty for the organizer's test PRs before launch.
    2. Keep package ghcr.io/$org/score PRIVATE; grant each fork Read under
       the package's "Manage Actions access" — https://github.com/orgs/$org/packages
       Do this for EVERY fork. A fork without it cannot pull the scorer, and
       doctor reports it as unverified until one of its scoring runs proves
       otherwise.
 EOF
+}
+
+# #465: keep Secure Development forks private until launch, so nobody sees
+# the event's branch, workflow or PR template — or forks and opens PRs —
+# before it starts. Only a DETACHED fork can be private, and only while the
+# event is not launched: a launched event's forks stay public, and when the
+# box cannot say (no EVENT_URL, down) nothing is changed — fail closed toward
+# leaving visibility as it is. Idempotent: an already-private fork costs one
+# read. Returns 1 when GitHub could not be read or written for some fork.
+privatize_forks() {
+  local org="$1" t name slug vis state rc=0
+  echo "== keep forks private until launch"
+  if [ "$DRY_RUN" -eq 1 ]; then
+    for t in $(all_targets); do
+      name="$(prov_repo_name "$t")"
+      echo "DRY-RUN: gh api -X PATCH repos/$org/$name -f visibility=private (once detached, while the event is not launched)"
+    done
+    return 0
+  fi
+  state="$(box_launch_state)"
+  case "$state" in
+    launched)
+      echo "  ✓ the event is launched — its forks stay public"
+      return 0
+      ;;
+    unknown)
+      printf '%s⚠️  could not confirm the event is not launched (no EVENT_URL, or its /health/deep did not answer) — fork visibility left as it is.%s\n' "$C_YELLOW" "$C_RESET"
+      echo "    Re-run 'ctf-setup.sh private' once the box answers."
+      return 0
+      ;;
+  esac
+  local is_fork forks
+  for t in $(all_targets); do
+    name="$(prov_repo_name "$t")"; slug="$org/$name"
+    # Attached (advisory: detach, re-run) is told apart from unreadable (an
+    # error: a broken token must not exit 0).
+    is_fork="$(gh api "repos/$slug" --jq '.fork' 2>/dev/null)" || is_fork=""
+    case "$is_fork" in
+      false) ;;
+      true)
+        printf '%s⚠️  %s is still in its fork network — detach it (Settings -> Leave fork network), then re-run '"'"'ctf-setup.sh private'"'"'.%s\n' "$C_YELLOW" "$name" "$C_RESET"
+        continue
+        ;;
+      *) echo "  ❌ $name: GitHub did not answer whether it is detached" >&2; rc=1; continue ;;
+    esac
+    # A fork contestants already forked (the event opened, a timed-out
+    # launch, a re-run in the launch window) must not go private: GitHub
+    # would split their forks off it, breaking their PRs.
+    forks="$(gh api "repos/$slug" --jq '.forks_count' 2>/dev/null)" || forks=""
+    case "$forks" in
+      0) ;;
+      ''|*[!0-9]*) echo "  ❌ $name: could not read its fork count" >&2; rc=1; continue ;;
+      *)
+        printf '%s⚠️  %s already has %s forks — left public: making it private now would cut those forks off from it.%s\n' "$C_YELLOW" "$name" "$forks" "$C_RESET"
+        continue
+        ;;
+    esac
+    vis="$(fork_visibility "$slug")" || vis=""
+    case "$vis" in
+      private) echo "  ✓ $name: already private" ;;
+      public)
+        if set_fork_visibility "$slug" private; then
+          echo "  → $name: now private"
+        else
+          echo "  ❌ $name: GitHub refused to make it private" >&2; rc=1
+        fi
+        ;;
+      *) echo "  ❌ $name: could not read its visibility" >&2; rc=1 ;;
+    esac
+  done
+  return $rc
+}
+
+cmd_private() {
+  require_env_file
+  if ! runs_secdev; then
+    echo "== SCORE_IMAGE is empty in ${OUT:-.env} — no Secure Development forks to keep private."
+    return 0
+  fi
+  local org; org="$(env_val GITHUB_ORG)"
+  [ -n "$org" ] || { echo "${OUT:-.env}: GITHUB_ORG missing" >&2; exit 1; }
+  require_targets
+  privatize_forks "$org"
+}
+
+# #465: launch day for an event running Secure Development, with the
+# organizer's own `gh` login — the box never holds a GitHub admin credential.
+#   1. Pre-flight, fail closed: every fork detached, the scorer package
+#      private, and no fork refused the scorer image. A gh error counts as a
+#      problem, never as "OK". Anything wrong refuses BEFORE any change.
+#   2. Wait for Launch: the organizer presses it in /admin → Event, and this
+#      polls EVENT_URL/health/deep until the box reports `launched`. The forks
+#      stay private throughout (#477 review): they ARE the event's content —
+#      the ctf branch, the workflow, the PR template — and opening them first
+#      handed everyone a head start for as long as the press took.
+#   3. Flip every fork public (an already-public one is skipped), within one
+#      poll interval of the press.
+# Every step is idempotent, so after a partial failure the report names the
+# state and a re-run finishes it. LAUNCH_WAIT_SECS (default 1800) and
+# LAUNCH_POLL_SECS (default 5) bound the wait.
+cmd_launch() {
+  require_env_file
+  if ! runs_secdev; then
+    echo "== This event does not run Secure Development — there are no forks to open."
+    echo "   Launch it from the box: press Launch in /admin → Event."
+    return 0
+  fi
+  local org url t name slug
+  org="$(env_val GITHUB_ORG)"
+  [ -n "$org" ] || { echo "${OUT:-.env}: GITHUB_ORG missing" >&2; exit 1; }
+  url="$(env_val EVENT_URL)"; url="${url%/}"
+  # Without the box's address there is no way to see the Launch press, and
+  # the forks open only after it — so refuse up front rather than open them
+  # unconfirmed.
+  [ -n "$url" ] || { echo "${OUT:-.env}: EVENT_URL missing — launch opens the forks only once the box reports launched, and needs its address to see that" >&2; exit 1; }
+  require_targets
+  # The wait's bounds are checked before anything changes: a typo here must
+  # not surface only after the forks are already public.
+  local max="${LAUNCH_WAIT_SECS:-1800}" poll="${LAUNCH_POLL_SECS:-5}"
+  case "$max" in ''|*[!0-9]*) echo "LAUNCH_WAIT_SECS must be a whole number of seconds (got '$max')" >&2; exit 2 ;; esac
+  case "$poll" in ''|*[!0-9]*) echo "LAUNCH_POLL_SECS must be a whole number of seconds (got '$poll')" >&2; exit 2 ;; esac
+
+  if [ "$DRY_RUN" -eq 1 ]; then
+    echo "DRY-RUN: check every fork in $org is detached, no fork was refused the scorer image, and ghcr.io/$org/score is private"
+    echo "DRY-RUN: would wait for $url/health/deep to report launched (press Launch in /admin → Event), with every fork still private"
+    for t in $(all_targets); do
+      echo "DRY-RUN: gh api -X PATCH repos/$org/$(prov_repo_name "$t") -f visibility=public"
+    done
+    return 0
+  fi
+
+  echo "== pre-flight"
+  local problems=""
+  for t in $(all_targets); do
+    name="$(prov_repo_name "$t")"; slug="$org/$name"
+    if ! fork_detached "$slug"; then
+      problems="$problems   - $name is still in its fork network (or GitHub did not answer)\n"
+    else
+      case "$(pull_grant_status "$slug")" in
+        MISSING) problems="$problems   - $name was refused the scorer image — grant it Read under the package's Manage Actions access\n" ;;
+        error) problems="$problems   - could not read $name's scoring runs (GitHub did not answer), so its scorer-image access is unchecked\n" ;;
+        *) ;; # granted, or unknown: no run has reached the pull step yet
+      esac
+    fi
+  done
+  if ! package_private "$org"; then
+    problems="$problems   - the scorer package ghcr.io/$org/score is not private (or GitHub did not answer)\n"
+  fi
+  if [ -n "$problems" ]; then
+    echo "❌ not launching — fix these first (nothing was changed):" >&2
+    printf '%b' "$problems" >&2
+    exit 1
+  fi
+  echo "  ✓ every fork detached, the scorer package private"
+
+  local state waited=0 launched_at
+  state="$(box_launch_state)"
+  if [ "$state" != launched ]; then
+    echo "== now press Launch in /admin → Event — waiting for $url to report launched (the forks stay private until it does)…"
+    while [ "$state" != launched ] && [ "$waited" -lt "$max" ]; do
+      sleep "$poll"; waited=$((waited + poll)); [ "$poll" -gt 0 ] || waited=$max
+      state="$(box_launch_state)"
+    done
+  fi
+  if [ "$state" != launched ]; then
+    echo "⚠️  $url is not launched yet (it reports: $state) — every fork is still private; nothing was changed." >&2
+    echo "   press Launch in /admin → Event, then re-run 'ctf-setup.sh launch'." >&2
+    exit 1
+  fi
+  launched_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+
+  echo "== open the forks"
+  local flipped="" vis
+  for t in $(all_targets); do
+    name="$(prov_repo_name "$t")"; slug="$org/$name"
+    vis="$(fork_visibility "$slug")" || vis=""
+    case "$vis" in
+      public) echo "  ✓ $name: already public" ;;
+      private)
+        if set_fork_visibility "$slug" public; then
+          echo "  → $name: now public"; flipped="$flipped $name"
+        else
+          echo "❌ GitHub refused to make $name public. Made public so far:${flipped:- none}. The box was not touched." >&2
+          echo "   Fix the cause and re-run 'ctf-setup.sh launch' — it picks up where this stopped." >&2
+          exit 1
+        fi
+        ;;
+      *)
+        echo "❌ could not read $name's visibility. Made public so far:${flipped:- none}. The box was not touched." >&2
+        echo "   Re-run 'ctf-setup.sh launch' — it picks up where this stopped." >&2
+        exit 1
+        ;;
+    esac
+  done
+
+  echo "== launched ✓ $url (confirmed $launched_at)"
+  echo "   forks made public now:${flipped:- none — every fork was already public}"
 }
 
 # Just the workflow-render step of cmd_org — for re-rendering after an
@@ -2013,6 +2275,9 @@ cmd_wizard() {
   if [ "$secdev" -eq 1 ]; then
     echo "   Secure Development provisions all six from targets.tsv: $(all_targets)."
     echo "   Choose which ones actually run in /admin -> Secure Development -> Targets."
+    echo "   Launch day: detach each fork, run 'ctf-setup.sh private' (forks stay private"
+    echo "   until launch), preview the event in /admin, then run 'ctf-setup.sh launch' —"
+    echo "   it opens every fork and waits for you to press Launch."
   fi
 }
 
@@ -2026,11 +2291,13 @@ if [ "$CMD" != "__selftest" ]; then
     upgrade) cmd_upgrade ;;
     teardown) cmd_teardown ;;
     doctor) cmd_doctor ;;
+    private) cmd_private ;;
+    launch) cmd_launch ;;
     app-manifest) cmd_app_manifest ;;
     app-config) cmd_app_config ;;
     oauth-app) cmd_oauth_app ;;
     oauth-config) cmd_oauth_config ;;
-    *) echo "usage: ctf-setup.sh [wizard|check|secrets|org|render|upgrade|teardown|doctor|app-manifest|app-config|oauth-app|oauth-config] [--dry-run] [--out .env] [--app-id N] [--pem path] [--installation-id N] [--client-id ID]" >&2
+    *) echo "usage: ctf-setup.sh [wizard|check|secrets|org|render|upgrade|teardown|doctor|private|launch|app-manifest|app-config|oauth-app|oauth-config] [--dry-run] [--out .env] [--app-id N] [--pem path] [--installation-id N] [--client-id ID]" >&2
        echo "  run with no subcommand (or 'wizard') for the guided step-by-step setup" >&2; exit 2 ;;
   esac
 fi
