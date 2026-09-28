@@ -22,6 +22,11 @@ function resolveAuth(env, apiUrl) {
     throw new Error("GITHUB_APP_PRIVATE_KEY must be base64-encoded PEM (a PEM private key)");
   }
   const installationId = env.GITHUB_APP_INSTALLATION_ID ? Number(env.GITHUB_APP_INSTALLATION_ID) : undefined;
+  // Number("abc") is NaN, which would mint against /installations/NaN on every
+  // tick; refuse it here, where the operator is looking.
+  if (installationId !== undefined && !(Number.isInteger(installationId) && installationId > 0)) {
+    throw new Error(`GITHUB_APP_INSTALLATION_ID must be a positive integer (got ${JSON.stringify(env.GITHUB_APP_INSTALLATION_ID)})`);
+  }
   // The org picks the installation when no id is set (appAuth.js).
   const auth = makeAppAuth({ appId: env.GITHUB_APP_ID, privateKey, installationId, org: (env.GITHUB_ORG ?? "").trim(), apiUrl });
   return { authMode: "app", getToken: (fetchImpl) => auth.getToken(fetchImpl) };

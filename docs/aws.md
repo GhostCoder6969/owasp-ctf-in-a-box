@@ -44,8 +44,8 @@ Two things did **not** change:
   connects *to*. Everything above it is the same code as compose.
 - **The isolation is still in the security groups.** ADR 41 put the boundary
   there rather than in the network topology, and it stays: only the ALB reaches
-  the app, only the app and workers reach `srh`, only the app and sync reach
-  the scorer (`:4000`), and only `srh` reaches ElastiCache. The app has no
+  the app, only the app, sync and the scorer reach `srh`, only the app and
+  sync reach the scorer (`:4000`), and only `srh` reaches ElastiCache. The app has no
   route to Redis at all.
 
 What it costs is the honest tradeoff, and the module README

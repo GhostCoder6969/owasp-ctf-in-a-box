@@ -50,6 +50,8 @@ output "next_steps" {
        ENCRYPTED WITH THIS EVENT'S KEY. --key-id is not optional: the tasks'
        decrypt grant names only this key, so a parameter stored under any
        other one fails at task start with an AccessDeniedException on KMS.
+       Replace each "..." with that secret's real value before running it —
+       --overwrite would otherwise store the literal "...".
 
          for s in BETTER_AUTH_SECRET GITHUB_CLIENT_SECRET SRH_TOKEN \
                   GITHUB_APP_PRIVATE_KEY SCORER_TOKEN; do   # the last two: Secure Development only

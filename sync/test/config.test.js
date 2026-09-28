@@ -109,12 +109,23 @@ test("the App auth discovers the installation for GITHUB_ORG", async () => {
   const seen = [];
   const fetchImpl = async (url) => {
     seen.push(String(url));
+    if (String(url).endsWith("/orgs/my-org/installation")) {
+      return { ok: true, status: 200, json: async () => ({ id: 6, account: { login: "my-org" } }) };
+    }
     if (String(url).endsWith("/app/installations")) {
-      return { ok: true, status: 200, json: async () => [{ id: 5, account: { login: "someone-else" } }, { id: 6, account: { login: "my-org" } }] };
+      return { ok: true, status: 200, json: async () => [{ id: 5, account: { login: "someone-else" } }] };
     }
     return { ok: true, status: 201, json: async () => ({ token: "t", expires_at: "2033-11-14T00:00:00Z" }) };
   };
   assert.equal(await cfg.getToken(fetchImpl), "t");
   assert.ok(seen.some((u) => u.endsWith("/app/installations/6/access_tokens")));
+});
+
+// Review (#479): Number("abc") is NaN, and a NaN id went straight into
+// /app/installations/NaN/access_tokens on every tick. Refuse it at start-up.
+test("a non-numeric GITHUB_APP_INSTALLATION_ID is refused at start-up", () => {
+  assert.throws(() => loadConfig({ ...ENV, GITHUB_APP_INSTALLATION_ID: "abc" }), /GITHUB_APP_INSTALLATION_ID must be a positive integer/);
+  assert.throws(() => loadConfig({ ...ENV, GITHUB_APP_INSTALLATION_ID: "0" }), /GITHUB_APP_INSTALLATION_ID must be a positive integer/);
+  assert.equal(typeof loadConfig({ ...ENV, GITHUB_APP_INSTALLATION_ID: "123" }).getToken, "function");
 });
 

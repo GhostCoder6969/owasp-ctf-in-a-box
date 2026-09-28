@@ -865,3 +865,41 @@ run "a_quiz_only_event_points_the_app_at_no_scorer" {
     error_message = "A quiz-only event creates no scorer name and no scorer group."
   }
 }
+
+// Review (#479): the App ids are numbers. A non-numeric one reached sync as a
+// string that became NaN (sync/src/config.js) — refused at plan time instead.
+run "a_non_numeric_github_app_id_is_refused" {
+  command = plan
+
+  variables {
+    enable_secure_development = true
+    github_app_id             = "my-app"
+  }
+
+  expect_failures = [var.github_app_id]
+}
+
+run "a_non_numeric_installation_id_is_refused" {
+  command = plan
+
+  variables {
+    github_app_installation_id = "abc"
+  }
+
+  expect_failures = [var.github_app_installation_id]
+}
+
+run "an_empty_installation_id_is_accepted" {
+  command = plan
+
+  variables {
+    enable_secure_development  = true
+    github_app_installation_id = ""
+  }
+
+  assert {
+    condition     = length(aws_ecs_task_definition.sync) == 1
+    error_message = "An empty installation id is legal: sync picks the installation on github_org."
+  }
+}
+

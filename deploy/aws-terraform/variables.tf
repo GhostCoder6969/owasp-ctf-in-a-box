@@ -166,12 +166,26 @@ variable "github_app_id" {
     condition     = !var.enable_secure_development || trimspace(var.github_app_id) != ""
     error_message = "github_app_id must name the GitHub App sync polls with when Secure Development is enabled: sync exits at start-up without one."
   }
+
+  // An App id is a number. A non-numeric one reached sync as a string it
+  // could never authenticate with.
+  validation {
+    condition     = var.github_app_id == "" || can(regex("^[1-9][0-9]*$", var.github_app_id))
+    error_message = "github_app_id must be the App's numeric id (a positive integer), e.g. \"123456\"."
+  }
 }
 
 variable "github_app_installation_id" {
   description = "The GitHub App's installation id on github_org. Optional: when empty, sync picks the App's installation on github_org itself, and refuses to start polling if the App is not installed there."
   type        = string
   default     = ""
+
+  // Empty is legal (sync finds the installation on github_org); anything else
+  // must be a number, or sync refuses to start (sync/src/config.js).
+  validation {
+    condition     = var.github_app_installation_id == "" || can(regex("^[1-9][0-9]*$", var.github_app_installation_id))
+    error_message = "github_app_installation_id must be empty (sync finds the installation on github_org) or a positive integer."
+  }
 }
 
 variable "enable_secure_development" {

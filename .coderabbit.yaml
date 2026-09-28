@@ -547,7 +547,11 @@ reviews:
 
         Terraform specifics — this is an ephemeral apply-up/destroy-down box,
         so do NOT flag missing encryption at rest, backup retention, or flow
-        logs. DO flag: ingress wider than the event needs, secrets in plaintext
+        logs, nor plaintext HTTP between the stack's own tasks inside the VPC
+        (app/sync/scorer -> srh, app/sync -> scorer): each hop carries a
+        bearer token and is admitted by a security group from its one caller
+        (docs/decisions.md ADR 63). DO flag: ingress wider than the event
+        needs, an internal hop with no bearer token, secrets in plaintext
         variables or user_data, a variable carrying a token without
         `sensitive = true`, wildcard IAM actions or resources, and resources
         that survive `destroy` and keep billing.

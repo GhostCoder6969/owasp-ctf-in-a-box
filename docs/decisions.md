@@ -75,6 +75,7 @@ their **Status** line; the record itself is never rewritten.
 - [ADR 60 — Stories: first-class objects, a derived unlock, and team scope](#adr-60-stories-first-class-objects-a-derived-unlock-and-team-scope)
 - [ADR 61 — Challenge attachments live in Redis, served only as downloads, behind the challenge's own visibility](#adr-61-challenge-attachments-live-in-redis-served-only-as-downloads-behind-the-challenges-own-visibility)
 - [ADR 62 — The landing page's footer does not repeat the sponsor credit](#adr-62-the-landing-pages-footer-does-not-repeat-the-sponsor-credit)
+- [ADR 63 — Service hops inside the stack are HTTP with a bearer token; the network is the boundary](#adr-63-service-hops-inside-the-stack-are-http-with-a-bearer-token-the-network-is-the-boundary)
 
 ## ADR 1. Keep the GitHub fork/PR/Action flow — it is the pedagogy
 
@@ -3729,3 +3730,38 @@ sponsor read, not two. Other pages are unchanged: `/sponsors` still pairs its
 full list with the footer's line, as ADR 57 set out. A new page that shows its own sponsor block passes
 `creditSponsors: false` the same way; the default keeps every other caller
 crediting them.
+
+## ADR 63. Service hops inside the stack are HTTP with a bearer token; the network is the boundary
+
+**Context.** #476 wired the AWS scorer the way compose always had: sync posts
+scores to it and the app reads the leaderboard from it, over
+`http://scorer.<name>.internal:4000` with a bearer token. A review asked for
+TLS on that hop (CWE-319): anyone who could read the VPC's traffic could
+capture the token. The same is true of every other internal hop the kit has:
+the app, sync and the scorer reach `srh` over `http://` with its bearer token,
+on compose, on Fly and on AWS alike. No decision had said so out loud.
+
+**Decision.** Traffic between the stack's own services stays plain HTTP, each
+hop authenticated with a bearer token, and the boundary is the network
+([ADR 41](#adr-41-authenticating-redis-and-cutting-the-app-tier-off-from-it)):
+compose networks, the Fly machine's loopback, or AWS security groups that
+admit each hop from its one caller. The public edge is TLS (Caddy, Fly, the
+ALB with its ACM certificate), and ElastiCache is reached over TLS with AUTH,
+because that hop leaves our tasks for a managed service.
+
+- **Why not TLS inside.** On AWS the tasks' ENIs sit in the event's own VPC,
+  with nothing else in it; reading that traffic already takes a foothold in
+  one of our tasks, which also holds the tokens themselves. TLS here would
+  add a private CA, certificate rotation and trust wiring to a stack that is
+  applied for one event and destroyed after it, and each is a new way for
+  event day to fail. Securing only the scorer hop would leave the `srh` hops
+  as they are, which buys nothing.
+- **What changes the answer.** Another tenant or workload sharing the
+  network; a hop that crosses it (another VPC, another account, the public
+  internet); or a stack that outlives an event. Any of these makes internal
+  TLS the right call, and the post-event follow-up issue tracks doing it.
+
+**Consequences.** A review should not flag plaintext HTTP between the stack's
+own services as such. It should flag a new internal hop without a bearer
+token, a security-group rule wider than the one caller, and any internal
+hop exposed beyond the stack's network.
