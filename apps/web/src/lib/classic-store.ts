@@ -1,4 +1,6 @@
 import "server-only";
+import { storyPositions, type Story } from "@/lib/story-lock";
+import { teamSolveKeys } from "@/lib/classic-team";
 // Re-exported, not redeclared — the admin UI cannot import a server-only
 // module, so the value lives in the dependency-free defaults file.
 export { CLASSIC_COOLDOWN_SEC } from "./classic-defaults";
@@ -16,6 +18,7 @@ import {
   CLASSIC_FLAG_KEY as FLAG_KEY,
   CLASSIC_FLAGNORM_KEY as FLAGNORM_KEY,
   CLASSIC_CATEGORIES_KEY as CATEGORIES_KEY,
+  CLASSIC_STORIES_KEY,
   CLASSIC_POINTS_KEY as POINTS_KEY,
   CLASSIC_SOLVED_KEY as SOLVED_KEY,
   CLASSIC_SOLVECOUNT_KEY as SOLVECOUNT_KEY,
@@ -690,6 +693,12 @@ export async function deleteChallenge(id: string): Promise<void> {
   ]);
   const failed = results.find((r) => r.error);
   if (failed) throw new Error(`Upstash HDEL failed: ${failed.error}`);
+  // A deleted step leaves its story (#463): the story shrinks, and the next
+  // step's prerequisite becomes the one before it — solves are kept, as above.
+  const stories = await listStories();
+  if (stories.some((st) => st.steps.includes(id))) {
+    await setStories(stories.map((st) => ({ ...st, steps: st.steps.filter((step) => step !== id) })));
+  }
 }
 
 /** Deletes ONLY the content keys — challenges, both flag hashes, categories,
@@ -707,6 +716,7 @@ export async function clearChallenges(): Promise<void> {
     ["DEL", FLAG_KEY],
     ["DEL", FLAGNORM_KEY],
     ["DEL", CATEGORIES_KEY],
+    ["DEL", CLASSIC_STORIES_KEY],
     ["DEL", HINTS_KEY],
   ]);
   // This runs on the destructive replace-all path (event-store's
@@ -998,13 +1008,27 @@ async function evaluateGate(
 // The points match is anchored with a trailing [,}] so it can only match a
 // complete "points":<int> pair, not a digit run appearing earlier in the blob.
 export const SUBMIT_SCRIPT = `
+local dry = ARGV[8] == '1'
+if redis.call('HEXISTS', KEYS[2], ARGV[1]) == 1 then return {'already'} end
+-- STORY LOCK (#463): ARGV[9] names this step's prerequisite ("" when the
+-- challenge is not a later story step). It is open only if some TEAMMATE —
+-- one of the solves hashes the caller handed in as KEYS[8..] — holds it.
+-- Checked FIRST, before the flag hash is read and before any read or write
+-- of attempts: a locked step touches no secret, spends no attempt and cannot
+-- be used to test a flag. The store reports it exactly like an unknown
+-- challenge (no oracle). A dry-run preview skips it.
+if not dry and ARGV[9] and ARGV[9] ~= '' then
+  local open = false
+  for i = 8, #KEYS do
+    if redis.call('HEXISTS', KEYS[i], ARGV[9]) == 1 then open = true break end
+  end
+  if not open then return {'locked'} end
+end
 local target = redis.call('HGET', KEYS[3], ARGV[1])
 if not target then return {'missing'} end
-if redis.call('HEXISTS', KEYS[2], ARGV[1]) == 1 then return {'already'} end
 
 local cooldownMs = tonumber(ARGV[5])
 local nowMs = tonumber(ARGV[6])
-local dry = ARGV[8] == '1'
 
 local attemptsRaw = redis.call('HGET', KEYS[1], ARGV[1])
 local attempts = 0
@@ -1070,7 +1094,7 @@ export type SubmitResult =
   // wrote NOTHING, so `points` is what the flag is worth, not what was banked.
   | { ok: true; correct: true; points: number; already?: boolean; dryRun?: true }
   | { ok: true; correct: false; dryRun?: true }
-  | { ok: false; reason: "paused" | "solved" | "cooldown"; retryAt?: string }
+  | { ok: false; reason: "paused" | "solved" | "cooldown" | "locked"; retryAt?: string }
   // The gate's lookup itself failed (fail-closed), the submission was
   // malformed / named an unknown challenge, or the script blew up. Kept
   // distinct from the gate reasons above so a caller-facing message can say
@@ -1118,7 +1142,33 @@ export async function submitFlag(
   const cooldownSec = settings?.classicCooldownSec ?? CLASSIC_COOLDOWN_SEC;
 
   const gate = await evaluateGate(settings, login, challengeId, cooldownSec, dryRun);
-  if (!gate.allowed) {
+
+  // STORY LOCK (#463): a later story step names its prerequisite, and the
+  // script checks it against every teammate's solves hash. Resolved here and
+  // enforced THERE (the script is the authority). A stories or team read that
+  // fails is `unavailable` — closed, never "no lock".
+  let prereq = "";
+  let lockKeys: string[] = [];
+  if (gate.allowed || gate.reason === "cooldown") {
+    try {
+      const [stories, existing] = await Promise.all([listStories(), listChallengeIds()]);
+      const pos = storyPositions(stories, existing).get(challengeId);
+      if (pos?.prereq) {
+        prereq = pos.prereq;
+        lockKeys = await teamSolveKeys(login);
+      }
+    } catch (err) {
+      console.error("classic: story lock lookup failed (failing closed):", errorLabel(err));
+      return { ok: false, reason: "unavailable" };
+    }
+  }
+
+  // A later story step's cooldown is left to the script (CodeRabbit #470): it
+  // checks the lock BEFORE the cooldown, so a locked step is answered like an
+  // unknown challenge — never with a cooldown an unknown id cannot have. The
+  // script still enforces the cooldown on an open step.
+  const cooldownDeferred = !gate.allowed && gate.reason === "cooldown" && prereq !== "";
+  if (!gate.allowed && !cooldownDeferred) {
     // Kept as its own branch (not folded into the passthrough below) so its
     // caller-facing shape can never accidentally pick up a retryAt the lookup
     // never actually established.
@@ -1148,6 +1198,7 @@ export async function submitFlag(
         POINTS_KEY, // KEYS[5]
         SOLVECOUNT_KEY, // KEYS[6]
         SOLVED_KEY, // KEYS[7]
+        ...lockKeys, // KEYS[8..] — teammates' solves hashes, for the story lock (#463)
       ],
       // BOTH comparison forms go in, and the script picks. Normalizing on this
       // side is non-negotiable (Lua's string.lower is ASCII-only — see the
@@ -1163,6 +1214,7 @@ export async function submitFlag(
         now.getTime(),
         caseSensitiveFlagForm(flag), // ARGV[7] — case preserved (issue #193)
         dryRun ? "1" : "0", // ARGV[8] — dry run: grade, write nothing (#464)
+        prereq, // ARGV[9] — story prerequisite, "" when none (#463)
       ],
     );
   } catch (err) {
@@ -1172,6 +1224,10 @@ export async function submitFlag(
 
   const [status, value, marker] = Array.isArray(verdict) ? (verdict as unknown[]) : [];
   if (status === "missing") return { ok: false, reason: "invalid" };
+  // A locked story step (#463): answered EXACTLY like an unknown challenge —
+  // a distinct refusal would confirm that a guessed id is a hidden step
+  // (CodeRabbit #470, secrecy boundary). Never a wrong answer either.
+  if (status === "locked") return { ok: false, reason: "invalid" };
   // A dry verdict carries a trailing 'dry' from the script itself, so a
   // preview result can never be read as a banked solve.
   if (marker === "dry") {
@@ -1189,4 +1245,98 @@ export async function submitFlag(
   if (status === "already") return { ok: true, correct: true, points: 0, already: true };
   if (status === "correct") return { ok: true, correct: true, points: Number(value) || 0 };
   return { ok: false, reason: "error" };
+}
+
+// ---------------------------------------------------------------------------
+// Stories (#463) — ordered chains of challenges a team unlocks step by step.
+// Stored like the category list: one JSON value. The lock itself is derived
+// (lib/story-lock.ts), never stored.
+
+export const CLASSIC_STORIES_MAX = 50;
+export const CLASSIC_STORY_STEPS_MAX = 64;
+export const CLASSIC_STORY_TITLE_MAX = 120;
+export const CLASSIC_STORY_INTRO_MAX = 2000;
+const STORY_ID_RE = /^[a-z0-9][a-z0-9-]{0,63}$/;
+
+function parseStoredStories(raw: unknown): Story[] {
+  if (raw === null || raw === undefined) return [];
+  if (typeof raw !== "string") throw new Error("stories: stored value is not a string");
+  const parsed = JSON.parse(raw) as unknown; // a corrupt value THROWS
+  if (!Array.isArray(parsed)) throw new Error("stories: stored value is not a list");
+  return parsed.map((v) => {
+    const o = v as Partial<Story>;
+    if (typeof o?.id !== "string" || typeof o.title !== "string" || !Array.isArray(o.steps)) {
+      throw new Error("stories: a stored story is malformed");
+    }
+    return {
+      id: o.id,
+      title: o.title,
+      intro: typeof o.intro === "string" ? o.intro : "",
+      steps: o.steps.filter((s): s is string => typeof s === "string"),
+    };
+  });
+}
+
+/** Every story, in organizer order. THROWS on a read error or a corrupt
+ *  value — unlike `listCategories`, which reads either as "none": "no stories"
+ *  would open every story step, so the caller's fail-CLOSED direction must
+ *  apply instead (a page errors, a grade answers `unavailable`). */
+export async function listStories(): Promise<Story[]> {
+  const [res] = await upstashPipeline([["GET", CLASSIC_STORIES_KEY]]);
+  if (res.error) throw new Error(`Upstash GET failed: ${res.error}`);
+  return parseStoredStories(res.result);
+}
+
+/** Replaces the whole story list, after validating it: unique story ids, a
+ *  non-empty title, a challenge in at most one story and at most once. Step
+ *  ids are checked for shape here and for existence by the authoring route.
+ *  Returns what was stored. */
+export async function setStories(stories: Story[]): Promise<Story[]> {
+  if (!Array.isArray(stories)) throw new ClassicValidationError("stories", "stories must be an array");
+  if (stories.length > CLASSIC_STORIES_MAX) {
+    throw new ClassicValidationError("stories", `At most ${CLASSIC_STORIES_MAX} stories are allowed`);
+  }
+  const storyIds = new Set<string>();
+  const stepOwner = new Map<string, string>();
+  const canonical: Story[] = [];
+  for (const st of stories) {
+    const id = typeof st?.id === "string" ? st.id.trim() : "";
+    if (!STORY_ID_RE.test(id)) throw new ClassicValidationError("stories", `Invalid story id: ${JSON.stringify(st?.id)}`);
+    if (storyIds.has(id)) throw new ClassicValidationError("stories", `Story ids must be unique: ${id}`);
+    storyIds.add(id);
+    const title = typeof st.title === "string" ? st.title.trim() : "";
+    if (!title || title.length > CLASSIC_STORY_TITLE_MAX) {
+      throw new ClassicValidationError("stories", `Story ${id} needs a title of at most ${CLASSIC_STORY_TITLE_MAX} characters`);
+    }
+    const intro = typeof st.intro === "string" ? st.intro.trim() : "";
+    if (intro.length > CLASSIC_STORY_INTRO_MAX) {
+      throw new ClassicValidationError("stories", `Story ${id}'s intro must be at most ${CLASSIC_STORY_INTRO_MAX} characters`);
+    }
+    if (!Array.isArray(st.steps) || st.steps.length > CLASSIC_STORY_STEPS_MAX) {
+      throw new ClassicValidationError("stories", `Story ${id} must have at most ${CLASSIC_STORY_STEPS_MAX} steps`);
+    }
+    const seen = new Set<string>();
+    for (const step of st.steps) {
+      if (typeof step !== "string" || !CLASSIC_ID_RE.test(step)) {
+        throw new ClassicValidationError("stories", `Story ${id} has an invalid step id: ${JSON.stringify(step)}`);
+      }
+      if (seen.has(step)) throw new ClassicValidationError("stories", `Story ${id} lists ${step} twice`);
+      seen.add(step);
+      const owner = stepOwner.get(step);
+      if (owner) throw new ClassicValidationError("stories", `${step} is in two stories (${owner}, ${id}) — a challenge belongs to one story`);
+      stepOwner.set(step, id);
+    }
+    canonical.push({ id, title, intro, steps: [...st.steps] });
+  }
+  const [res] = await upstashPipeline([["SET", CLASSIC_STORIES_KEY, JSON.stringify(canonical)]]);
+  if (res.error) throw new Error(`Upstash SET failed: ${res.error}`);
+  return canonical;
+}
+
+/** The ids of every challenge that exists — what `storyPositions` needs to
+ *  drop a stale story step (#463). One HKEYS; THROWS on a read error. */
+export async function listChallengeIds(): Promise<Set<string>> {
+  const [res] = await upstashPipeline([["HKEYS", CHALLENGES_KEY]]);
+  if (res.error) throw new Error(`Upstash HKEYS failed: ${res.error}`);
+  return new Set(Array.isArray(res.result) ? (res.result as unknown[]).filter((v): v is string => typeof v === "string") : []);
 }

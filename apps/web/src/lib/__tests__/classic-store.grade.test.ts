@@ -7,6 +7,11 @@
 // quiz-store.grade.test.ts proves GRADE_SCRIPT's ordering.
 
 import { beforeEach, describe, expect, it, vi } from "vitest";
+// #463: the team's solves keys come from the team store; pinned here.
+const classicTeam = vi.hoisted(() => ({
+  teamSolveKeys: vi.fn(async (login: string) => [`ctf:classic:solves:${login}`, "ctf:classic:solves:bob"]),
+}));
+vi.mock("@/lib/classic-team", () => classicTeam);
 
 const mocks = vi.hoisted(() => ({
   upstashEval: vi.fn<(script: string, keys: string[], args: (string | number)[]) => Promise<unknown>>(),
@@ -355,7 +360,11 @@ describe("the grading script itself (text invariants)", () => {
     ]) {
       expect(idx).toBeGreaterThan(-1);
     }
-    expect(missing).toBeLessThan(guard);
+    // The already-solved guard reads only the caller's own solves; the flag
+    // hash (the `missing` read) comes after the story lock (CodeRabbit #470),
+    // and still before anything is spent or written.
+    expect(guard).toBeLessThan(missing);
+    expect(missing).toBeLessThan(cooldownReturn);
     // The authoritative cooldown re-check happens after the already-solved
     // guard but strictly BEFORE any attempt is spent — a refusal writes
     // nothing. And because the guard precedes every increment, a login can
@@ -543,5 +552,57 @@ describe("dry run (#464 admin preview)", () => {
     evalReturns(["correct", "50"]);
     expect(await submitFlag("alice", "chal-1", "CTF{x}")).toEqual({ ok: true, correct: true, points: 50 });
     expect(lastEval().argv[7]).toBe("0");
+  });
+});
+
+describe("story lock (#463)", () => {
+  const storiesReply = (steps: string[]) => [{ result: JSON.stringify([{ id: "op", title: "Op", intro: "", steps }]) }];
+
+  it("hands the script the step's prerequisite and every teammate's solves key", async () => {
+    gateReads(null, null);
+    mocks.upstashPipeline.mockResolvedValueOnce(storiesReply(["recon", "chal-1"]));
+    mocks.upstashPipeline.mockResolvedValueOnce([{ result: ["recon", "chal-1"] }]); // existing ids
+    evalReturns(["correct", "50"]);
+    await submitFlag("alice", "chal-1", "CTF{x}");
+    const { keys, argv } = lastEval();
+    expect(argv[8]).toBe("recon");
+    expect(keys.slice(7)).toEqual(["ctf:classic:solves:alice", "ctf:classic:solves:bob"]);
+  });
+
+  it("reports the script's `locked` exactly as an unknown challenge — no oracle, never a wrong answer", async () => {
+    gateReads(null, null);
+    mocks.upstashPipeline.mockResolvedValueOnce(storiesReply(["recon", "chal-1"]));
+    mocks.upstashPipeline.mockResolvedValueOnce([{ result: ["recon", "chal-1"] }]); // existing ids
+    evalReturns(["locked"]);
+    expect(await submitFlag("alice", "chal-1", "CTF{x}")).toEqual({ ok: false, reason: "invalid" });
+  });
+
+  // CodeRabbit #470: the TS cooldown pre-check ran BEFORE the story lock, so a
+  // step that became locked (a reorder) while in cooldown answered `cooldown`
+  // — a refusal an unknown id never gives. For a story step the pre-check is
+  // left to the script, which checks the lock first.
+  it("answers a locked step in cooldown like an unknown challenge, not with a cooldown", async () => {
+    gateReads(null, JSON.stringify({ attempts: 1, lastAt: new Date().toISOString() }));
+    mocks.upstashPipeline.mockResolvedValueOnce(storiesReply(["recon", "chal-1"]));
+    mocks.upstashPipeline.mockResolvedValueOnce([{ result: ["recon", "chal-1"] }]); // existing ids
+    evalReturns(["locked"]);
+    expect(await submitFlag("alice", "chal-1", "CTF{x}")).toEqual({ ok: false, reason: "invalid" });
+    expect(evalCalls()).toHaveLength(1);
+  });
+
+  it("passes no prerequisite for step 1 or a challenge outside any story", async () => {
+    gateReads(null, null);
+    mocks.upstashPipeline.mockResolvedValueOnce(storiesReply(["chal-1", "web"]));
+    mocks.upstashPipeline.mockResolvedValueOnce([{ result: ["chal-1", "web"] }]); // existing ids
+    evalReturns(["correct", "50"]);
+    await submitFlag("alice", "chal-1", "CTF{x}");
+    expect(lastEval().argv[8]).toBe("");
+  });
+
+  it("fails CLOSED when the stories cannot be read: `unavailable`, and the script never runs", async () => {
+    gateReads(null, null);
+    mocks.upstashPipeline.mockResolvedValueOnce([{ error: "NOAUTH" }]);
+    expect(await submitFlag("alice", "chal-1", "CTF{x}")).toEqual({ ok: false, reason: "unavailable" });
+    expect(evalCalls()).toHaveLength(0);
   });
 });

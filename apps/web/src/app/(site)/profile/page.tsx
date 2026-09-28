@@ -3,6 +3,8 @@
 // contestant's progress from the active leaderboard source and renders their
 // dossier: identity, overall progress, per-app breakdown, and team control.
 
+import { getTeamClassicSolvedIds } from "@/lib/classic-team";
+import { isLocked, storyPositions } from "@/lib/story-lock";
 import type { Metadata } from "next";
 import { headers } from "next/headers";
 import { redirect } from "next/navigation";
@@ -13,7 +15,7 @@ import AppBreakdown from "@/components/app-breakdown";
 import ProgressRow, { moduleUnit } from "@/components/progress/progress-row";
 import ChallengeList from "@/components/progress/challenge-list";
 import RemainingLine from "@/components/progress/remaining-line";
-import { maxPointsAcrossModules } from "@/app/(site)/profile/module-blocks";
+import { maxPointsAcrossModules, visibleClassic } from "@/app/(site)/profile/module-blocks";
 import { fillStyle } from "@/components/progress/progress-bar";
 import ProfileStatTiles, { type StatTile } from "@/components/profile-stat-tiles";
 import { loadTeamStanding } from "@/app/(site)/profile/team-standing";
@@ -37,7 +39,7 @@ import {
   type AiTotal,
   type ViewerAi,
 } from "@/lib/ai-store";
-import {
+import { listStories,
   getClassicTotals,
   getViewerClassic,
   listChallenges,
@@ -213,7 +215,6 @@ export default async function ProfilePage() {
   // deleted question/challenge deliberately leaves banked points in place, so
   // the numerator can legitimately exceed a shrunken denominator.
   const quizMaxPoints = quizQuestions.reduce((sum, q) => sum + (Number(q.points) || 0), 0);
-  const classicMaxPoints = classicChallenges.reduce((sum, c) => sum + (Number(c.points) || 0), 0);
   const aiMaxPoints = aiChallenges.reduce((sum, c) => sum + (Number(c.points) || 0), 0);
   // Only the apps the event actually enabled — same filter the per-app grid
   // used before this task, kept so a target an organizer turned off never
@@ -227,6 +228,23 @@ export default async function ProfilePage() {
   // module-blocks.ts does the arithmetic. A module's slice is undefined
   // exactly when that module is disabled, which is what keeps a disabled
   // module out of every derived figure below.
+  // #463: story steps still locked for this viewer's team never reach the
+  // page — not their title, points or category (review C1). A stories read
+  // that fails errors the page, like the challenge list would.
+  let classicLocked: Set<string> = new Set();
+  if (classicEnabled) {
+    const stories = await listStories();
+    if (stories.length > 0) {
+      const positions = storyPositions(stories, new Set(classicChallenges.map((c) => c.id)));
+      const teamSolved = await getTeamClassicSolvedIds(login);
+      classicLocked = new Set([...positions.values()].filter((pos) => isLocked(pos, teamSolved)).map((pos) => pos.id));
+    }
+  }
+
+  // Locked steps are out of the ceiling too, not only the list (CodeRabbit #470).
+  const classicVisible = visibleClassic(classicChallenges, classicLocked);
+  const classicMaxPoints = classicVisible.maxPoints;
+
   const moduleInput: ProfileModuleInput = {
     profile,
     appsRecord,
@@ -235,7 +253,7 @@ export default async function ProfilePage() {
     secureDev: secureDevEnabled,
     quiz: quizEnabled ? { total: quizTotal, questions: quizQuestions, maxPoints: quizMaxPoints, viewer: viewerQuiz } : undefined,
     classic: classicEnabled
-      ? { total: classicTotal, challenges: classicChallenges, maxPoints: classicMaxPoints, viewer: viewerClassic }
+      ? { total: classicTotal, challenges: classicVisible.challenges, maxPoints: classicMaxPoints, viewer: viewerClassic, locked: classicLocked }
       : undefined,
     ai: aiEnabled ? { total: aiTotal, challenges: aiChallenges, maxPoints: aiMaxPoints, viewer: viewerAi } : undefined,
   };
@@ -295,7 +313,7 @@ export default async function ProfilePage() {
     classicEnabled && classicChallenges.length > 0 && {
       unit: moduleUnit("classic"),
       done: classicTotal?.solved ?? 0,
-      total: Math.max(classicChallenges.length, classicTotal?.solved ?? 0),
+      total: Math.max(classicVisible.challenges.length, classicTotal?.solved ?? 0),
     },
     aiEnabled && aiChallenges.length > 0 && {
       unit: moduleUnit("ai"),

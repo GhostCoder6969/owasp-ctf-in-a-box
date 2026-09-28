@@ -13,6 +13,13 @@ const mocks = vi.hoisted(() => ({
 }));
 
 vi.mock("server-only", () => ({}));
+// #463: no stories on this board unless a test says otherwise.
+const storyMocks = vi.hoisted(() => ({ listStories: vi.fn(async () => [] as unknown[]), teamSolveKeys: vi.fn(async () => [] as string[]) }));
+vi.mock("@/lib/classic-store", () => ({
+  listStories: storyMocks.listStories,
+  listChallengeIds: async () => new Set(["recon", "web", "web-robots-only"]),
+}));
+vi.mock("@/lib/classic-team", () => ({ teamSolveKeys: storyMocks.teamSolveKeys }));
 vi.mock("@/lib/upstash", () => ({
   upstashEval: mocks.upstashEval,
   upstashPipeline: mocks.upstashPipeline,
@@ -709,5 +716,30 @@ describe("getHintAvailability", () => {
     const store = await loadStore(false);
     expect(await store.getHintAvailability()).toEqual({});
     expect(mocks.upstashPipeline).not.toHaveBeenCalled();
+  });
+});
+
+describe("the story lock on classic hints (#463)", () => {
+  it("hands the script the prerequisite and the teammates' solves keys, and reports `locked` exactly as a missing hint", async () => {
+    const store = await loadStore();
+    storyMocks.listStories.mockResolvedValueOnce([{ id: "op", title: "Op", intro: "", steps: ["recon", "web"] }]);
+    storyMocks.teamSolveKeys.mockResolvedValueOnce(["ctf:classic:solves:alice", "ctf:classic:solves:bob"]);
+    mocks.upstashEval.mockResolvedValueOnce(["locked"]);
+    const result = await store.revealHint("alice", "classic", "web");
+    // No oracle (CodeRabbit #470): a locked step's hint is indistinguishable
+    // from a challenge with no hint.
+    expect(result).toEqual({ ok: false, missing: true, error: "No hint available for this challenge" });
+    const [, keys, argv] = mocks.upstashEval.mock.calls.at(-1)!;
+    expect(keys.slice(4)).toEqual(["ctf:classic:solves:alice", "ctf:classic:solves:bob"]);
+    expect(argv[6]).toBe("recon");
+  });
+
+  it("refuses (closed) when the stories cannot be read, without running the script", async () => {
+    const store = await loadStore();
+    storyMocks.listStories.mockRejectedValueOnce(new Error("NOAUTH"));
+    mocks.upstashEval.mockClear();
+    vi.spyOn(console, "error").mockImplementation(() => {});
+    expect((await store.revealHint("alice", "classic", "web")).ok).toBe(false);
+    expect(mocks.upstashEval).not.toHaveBeenCalled();
   });
 });

@@ -1,7 +1,9 @@
 import { NextResponse } from "next/server";
 import { LOGIN_RE } from "@/lib/admin-admins";
 import { getViewerAi, listAiChallenges } from "@/lib/ai-store";
-import { getViewerClassic, listChallenges } from "@/lib/classic-store";
+import { getViewerClassic, listChallenges, listStories } from "@/lib/classic-store";
+import { isLocked, lockedLabel, storyPositions } from "@/lib/story-lock";
+import { getTeamClassicSolvedIds } from "@/lib/classic-team";
 import { auth } from "@/lib/auth";
 import { isModuleLive } from "@/lib/enabled-modules";
 import { requireLaunchedApi } from "@/lib/launch";
@@ -31,7 +33,8 @@ export async function GET(request: Request) {
   // module content. The session is optional here (the board is public once
   // launched); it is read only so an admin's preview board still loads.
   const session = await auth.api.getSession({ headers: request.headers }).catch(() => null);
-  const notLaunched = await requireLaunchedApi((session?.user as { login?: string } | undefined)?.login);
+  const viewerLogin = (session?.user as { login?: string } | undefined)?.login;
+  const notLaunched = await requireLaunchedApi(viewerLogin);
   if (notLaunched) return notLaunched;
 
   const raw = new URL(request.url).searchParams.get("logins") ?? "";
@@ -60,11 +63,24 @@ export async function GET(request: Request) {
 
   let classic: Item[] | null = null;
   if (classicLive) {
-    const [challenges, viewers] = await Promise.all([
+    const [challenges, viewers, stories] = await Promise.all([
       listChallenges(),
       Promise.all(logins.map((l) => getViewerClassic(l))),
+      listStories(),
     ]);
+    // #463: a story step is redacted to its position alone — label, points
+    // AND id, since an id is derived from the title — unless it is open BOTH
+    // for the queried logins (the team whose row this is) AND for the
+    // VIEWER's own team. This route is public, so the queried team alone
+    // would let anyone read the leader's unlocked steps by expanding a row.
+    const positions = storyPositions(stories, new Set(challenges.map((c) => c.id)));
+    const teamSolved = new Set(viewers.flatMap((v) => Object.keys(v.solved)));
+    const viewerSolved = positions.size > 0 && viewerLogin ? await getTeamClassicSolvedIds(viewerLogin) : new Set<string>();
     classic = challenges.map((c) => {
+      const pos = positions.get(c.id);
+      if (pos && (isLocked(pos, teamSolved) || isLocked(pos, viewerSolved))) {
+        return { id: `locked:${pos.storyId}:${pos.position}`, label: lockedLabel(pos), points: 0, done: false };
+      }
       const hit = viewers.map((v) => v.solved[c.id]).find(Boolean);
       return { id: c.id, label: c.title, points: c.points, done: Boolean(hit), earnedPoints: hit?.points };
     });

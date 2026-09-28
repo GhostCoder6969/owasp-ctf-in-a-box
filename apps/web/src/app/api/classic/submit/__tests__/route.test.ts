@@ -258,3 +258,16 @@ describe("a teamless admin preview (#464)", () => {
     expect(submitFlag).toHaveBeenCalledWith("alice", "c-1", "CTF{x}", { dryRun: true });
   });
 });
+
+describe("a locked story step (#463)", () => {
+  // CodeRabbit #470 (secrecy boundary): the store reports a locked step as
+  // an unknown challenge, so the route's answer is the same 404 — a guessed
+  // id cannot be confirmed as a hidden step.
+  it("answers a locked step exactly as an unknown challenge", async () => {
+    session("alice");
+    storeReturns({ ok: false, reason: "invalid" });
+    const res = await POST(req({ challengeId: "c-1", flag: "CTF{x}" }));
+    expect(res.status).toBe(404);
+    expect(await res.json()).toEqual({ error: "challenge not found" });
+  });
+});

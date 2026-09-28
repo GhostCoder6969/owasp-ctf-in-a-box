@@ -1,4 +1,5 @@
 import "server-only";
+import { errorLabel } from "@/lib/error-label";
 // Re-exported, not redeclared: the admin UI is a Client Component and cannot
 // import from this server-only module, so the values live in the
 // dependency-free defaults file and both sides read the same constant.
@@ -12,6 +13,9 @@ import { CLASSIC_HINTS_KEY, classicSolvesKey } from "@/lib/classic-keys";
 import { isModuleLive } from "@/lib/enabled-modules";
 import { userHintTimesKey } from "@/lib/team-keys";
 import { upstashEval, upstashPipeline } from "@/lib/upstash";
+import { listChallengeIds, listStories } from "@/lib/classic-store";
+import { teamSolveKeys } from "@/lib/classic-team";
+import { storyPositions } from "@/lib/story-lock";
 
 /**
  * Paid hints — for `classic` and `ai`. **Secure Development has none**, and
@@ -110,7 +114,18 @@ export function isHintTarget(value: string): value is HintTarget {
 // ARGV: [1]=challengeId [2]=<app>/<id> [3]=login [4]=cost [5]=now (ISO)
 //       [6]="1" for a DRY RUN (#464 admin preview): read the text, write
 //       nothing — no SADD, no charge, no purchase time.
-const REVEAL_SCRIPT = `
+//       [7]=story prerequisite (#463), "" when none — open only if a TEAMMATE
+//       (a solves hash in KEYS[5..]) holds it; checked before any charge.
+// Exported for the live suite only.
+export const REVEAL_SCRIPT = `
+-- The story lock (#463) comes FIRST: a locked step's hint is never read.
+if ARGV[6] ~= '1' and ARGV[7] and ARGV[7] ~= '' then
+  local open = false
+  for i = 5, #KEYS do
+    if redis.call('HEXISTS', KEYS[i], ARGV[7]) == 1 then open = true break end
+  end
+  if not open then return {'locked'} end
+end
 local hint = redis.call('HGET', KEYS[3], ARGV[1])
 if not hint then return {'missing'} end
 if ARGV[6] == '1' then return {'preview', hint, '0'} end
@@ -286,12 +301,31 @@ export async function revealHint(
     return { ok: false, error: "Hints are not enabled" };
   }
 
+  // STORY LOCK (#463): a classic hint for a later story step is refused by
+  // the script unless a teammate solved the step before it. Resolved here,
+  // enforced there; a stories/team read failure refuses (closed).
+  let prereq = "";
+  let lockKeys: string[] = [];
+  if (target === "classic") {
+    try {
+      const [stories, existing] = await Promise.all([listStories(), listChallengeIds()]);
+      const pos = storyPositions(stories, existing).get(id);
+      if (pos?.prereq) {
+        prereq = pos.prereq;
+        lockKeys = await teamSolveKeys(login);
+      }
+    } catch (err) {
+      console.error("Hint reveal: story lock lookup failed (failing closed):", errorLabel(err));
+      return { ok: false, error: "Hint reveal failed. Try again" };
+    }
+  }
+
   let verdict: unknown;
   try {
     verdict = await upstashEval(
       REVEAL_SCRIPT,
-      [userHintsKey(login), SPENT_KEY, hintHashKey(target), userHintTimesKey(login)],
-      [id, `${target}/${id}`, login, cost, new Date().toISOString(), dryRun ? "1" : "0"],
+      [userHintsKey(login), SPENT_KEY, hintHashKey(target), userHintTimesKey(login), ...lockKeys],
+      [id, `${target}/${id}`, login, cost, new Date().toISOString(), dryRun ? "1" : "0", prereq],
     );
   } catch (err) {
     console.error("Hint reveal failed:", err);
@@ -300,6 +334,11 @@ export async function revealHint(
 
   const [status, hint, spent] = Array.isArray(verdict) ? (verdict as unknown[]) : [];
   if (status === "missing") {
+    return { ok: false, missing: true, error: "No hint available for this challenge" };
+  }
+  // Exactly a missing hint (CodeRabbit #470): a distinct refusal would
+  // confirm that a guessed id is a locked story step.
+  if (status === "locked") {
     return { ok: false, missing: true, error: "No hint available for this challenge" };
   }
   if (status === "preview" && typeof hint === "string") {

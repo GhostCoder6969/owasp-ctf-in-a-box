@@ -14,13 +14,20 @@ const mocks = vi.hoisted(() => ({
   getViewerAi: vi.fn(),
   getSession: vi.fn(),
   requireLaunchedApi: vi.fn(),
+  listStories: vi.fn(async () => [] as { id: string; title: string; intro: string; steps: string[] }[]),
+  getTeamClassicSolvedIds: vi.fn(async () => new Set<string>()),
 }));
+vi.mock("@/lib/classic-team", () => ({ getTeamClassicSolvedIds: mocks.getTeamClassicSolvedIds }));
 vi.mock("server-only", () => ({}));
 vi.mock("@/lib/auth", () => ({ auth: { api: { getSession: mocks.getSession } } }));
 vi.mock("@/lib/launch", () => ({ requireLaunchedApi: mocks.requireLaunchedApi }));
 vi.mock("@/lib/enabled-modules", () => ({ isModuleLive: mocks.isModuleLive }));
 vi.mock("@/lib/quiz-store", () => ({ listQuestions: mocks.listQuestions, getViewerQuiz: mocks.getViewerQuiz }));
-vi.mock("@/lib/classic-store", () => ({ listChallenges: mocks.listChallenges, getViewerClassic: mocks.getViewerClassic }));
+vi.mock("@/lib/classic-store", () => ({
+  listChallenges: mocks.listChallenges,
+  getViewerClassic: mocks.getViewerClassic,
+  listStories: mocks.listStories,
+}));
 vi.mock("@/lib/ai-store", () => ({ listAiChallenges: mocks.listAiChallenges, getViewerAi: mocks.getViewerAi }));
 
 import { GET } from "@/app/api/board/items/route";
@@ -119,5 +126,64 @@ describe("GET /api/board/items pre-launch lock (#464)", () => {
     const res = await GET(req("alice"));
     expect(res.status).toBe(200);
     expect(mocks.requireLaunchedApi).toHaveBeenCalledWith(undefined);
+  });
+});
+
+describe("GET /api/board/items and a locked story step (#463)", () => {
+  it("redacts a step the team has not unlocked — label, points AND id (ids are derived from titles)", async () => {
+    mocks.listChallenges.mockResolvedValue([
+      { id: "recon-ab12cd", title: "Recon", points: 10 },
+      { id: "secret-sqli-cd34ef", title: "Secret SQLi", points: 50 },
+    ]);
+    mocks.listStories.mockResolvedValue([{ id: "op", title: "Op", intro: "", steps: ["recon-ab12cd", "secret-sqli-cd34ef"] }]);
+    mocks.getViewerClassic.mockResolvedValue({ solved: {}, attempts: {} });
+    const body = JSON.stringify(await (await GET(req("alice"))).json());
+    expect(body).not.toContain("Secret SQLi");
+    expect(body).not.toContain("secret-sqli");
+    expect(body).toContain("??? — step 2 of 2");
+  });
+
+  it("shows the step once any of the given logins (the team) has solved the one before it", async () => {
+    mocks.listChallenges.mockResolvedValue([
+      { id: "recon-ab12cd", title: "Recon", points: 10 },
+      { id: "secret-sqli-cd34ef", title: "Secret SQLi", points: 50 },
+    ]);
+    mocks.listStories.mockResolvedValue([{ id: "op", title: "Op", intro: "", steps: ["recon-ab12cd", "secret-sqli-cd34ef"] }]);
+    mocks.getViewerClassic.mockImplementation(async (l: string) =>
+      l === "bob" ? { solved: { "recon-ab12cd": { points: 10, at: "x" } }, attempts: {} } : { solved: {}, attempts: {} },
+    );
+    // The viewer is on that team (their own team has it open too — review C2).
+    mocks.getSession.mockResolvedValue({ user: { login: "alice" } });
+    mocks.getTeamClassicSolvedIds.mockResolvedValue(new Set(["recon-ab12cd"]));
+    const body = JSON.stringify(await (await GET(req("alice,bob"))).json());
+    expect(body).toContain("Secret SQLi");
+  });
+});
+
+describe("GET /api/board/items redacts for the VIEWER too (#463, review C2)", () => {
+  const setup = () => {
+    mocks.listChallenges.mockResolvedValue([
+      { id: "recon-ab12cd", title: "Recon", points: 10 },
+      { id: "secret-sqli-cd34ef", title: "Secret SQLi", points: 50 },
+    ]);
+    mocks.listStories.mockResolvedValue([{ id: "op", title: "Op", intro: "", steps: ["recon-ab12cd", "secret-sqli-cd34ef"] }]);
+    // The LEADING team has unlocked step 2…
+    mocks.getViewerClassic.mockResolvedValue({ solved: { "recon-ab12cd": { points: 10, at: "x" } }, attempts: {} });
+  };
+
+  it("never shows a signed-out visitor a step the queried team unlocked but they have not", async () => {
+    setup();
+    mocks.getSession.mockResolvedValue(null);
+    const body = JSON.stringify(await (await GET(req("leader"))).json());
+    expect(body).not.toContain("Secret SQLi");
+    expect(body).toContain("??? — step 2 of 2");
+  });
+
+  it("shows it to a viewer whose OWN team has unlocked it", async () => {
+    setup();
+    mocks.getSession.mockResolvedValue({ user: { login: "alice" } });
+    mocks.getTeamClassicSolvedIds.mockResolvedValue(new Set(["recon-ab12cd"]));
+    const body = JSON.stringify(await (await GET(req("leader"))).json());
+    expect(body).toContain("Secret SQLi");
   });
 });
