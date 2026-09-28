@@ -862,3 +862,57 @@ describe("AdminControls ai panel", () => {
     expect(panelFor(html, "ai")).toContain('value="42"');
   });
 });
+
+describe("the Launch block (#464)", () => {
+  const render = (over: Partial<typeof settings>) =>
+    panelFor(
+      renderToStaticMarkup(
+        <AdminControls viewerLogin="organizer" eventName="OWASP CTF in a Box" defaultModuleIds={["secure-development"]} secureDevAvailable initial={{ ...settings, ...over }} modules={twoModules} />,
+      ),
+      "event",
+    );
+
+  it("offers Launch now while not launched", () => {
+    const html = render({ scoringStartsAt: null });
+    expect(html).toContain("Not launched");
+    expect(html).toContain("Launch now");
+    expect(html).not.toContain("Un-launch");
+  });
+
+  it("names a scheduled launch and still offers Launch now", () => {
+    const html = render({ scoringStartsAt: "2999-01-01T00:00:00.000Z" });
+    expect(html).toContain("Scheduled for");
+    expect(html).toContain("Launch now");
+  });
+
+  // CodeRabbit #469: the panel says why Launch now cannot work, instead of
+  // leaving the refusal to the save.
+  it("holds Launch now while Scoring closes has already passed, and says what to fix", () => {
+    const html = render({ scoringStartsAt: null, scoringEndsAt: "2000-01-01T00:00:00.000Z" });
+    expect(html).toMatch(/Scoring closes has already passed/);
+    expect(html).toMatch(/<button[^>]*disabled=""[^>]*>Launch now<\/button>/);
+  });
+
+  it("offers Un-launch once live", () => {
+    const html = render({ scoringStartsAt: "2000-01-01T00:00:00.000Z" });
+    expect(html).toContain("Live since");
+    expect(html).toContain("Un-launch");
+    expect(html).not.toContain("Launch now");
+  });
+
+  it("says scoring stays frozen while the event is paused (a reset freezes and relocks)", () => {
+    const html = render({ scoringStartsAt: null, paused: true });
+    expect(html).toContain("Scoring is frozen");
+  });
+
+  // The start is written on the SERVER's clock; a client clock behind it must
+  // not show a just-launched event as "Scheduled". A start at or before the
+  // settings' own updatedAt (also a server instant) is already live.
+  it("treats a start at or before the last server save as live, whatever the client clock says", () => {
+    const html = render({ scoringStartsAt: "2999-01-01T00:00:00.000Z", updatedAt: "2999-01-01T00:00:05.000Z" });
+    expect(html).toContain("Live since");
+    // CodeRabbit #469: the "Right now" scoring readout uses the SAME floored
+    // now — it must not say "outside its window" beside "Live since".
+    expect(html).toContain("scoring is live");
+  });
+});

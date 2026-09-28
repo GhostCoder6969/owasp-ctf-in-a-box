@@ -512,6 +512,8 @@ describe("scheduled windows", () => {
 
   it("updateAdminSettings: valid ISO is stored normalised (HSET); null clears (HDEL)", async () => {
     mocks.upstashEval.mockResolvedValue(["scoringStartsAt", "2026-01-01T00:00:00.000Z", "updatedBy", "a", "updatedAt", "x"]);
+    // A start alone reads the stored end, to check the window can open (#464).
+    mocks.upstashPipeline.mockResolvedValue([{ result: [] }]);
     await updateAdminSettings({ scoringStartsAt: "2026-01-01T00:00:00Z" }, "a");
     let [, , args] = mocks.upstashEval.mock.calls[0];
     let strArgs = args.map(String);
@@ -526,6 +528,44 @@ describe("scheduled windows", () => {
     strArgs = args.map(String);
     expect(strArgs[4]).toBe("1"); // numDels = 1
     expect(strArgs.slice(5, 6)).toContain("scoringEndsAt"); // the del target
+  });
+
+  // #464 Launch now: "now" is resolved on the SERVER's clock, so an
+  // organizer's skewed laptop clock can never "launch" into the future.
+  it("updateAdminSettings: scoringStartsAt \"now\" stores the server's current instant", async () => {
+    mocks.upstashEval.mockResolvedValue(["updatedBy", "a", "updatedAt", "x"]);
+    mocks.upstashPipeline.mockResolvedValue([{ result: [] }]);
+    const before = Date.now();
+    await updateAdminSettings({ scoringStartsAt: "now" }, "a");
+    const after = Date.now();
+    const strArgs = mocks.upstashEval.mock.calls[0][2].map(String);
+    const stored = Date.parse(strArgs[strArgs.indexOf("scoringStartsAt") + 1]);
+    expect(stored).toBeGreaterThanOrEqual(before);
+    expect(stored).toBeLessThanOrEqual(after);
+  });
+
+  // CodeRabbit #469: Launch now under a Scoring closes already in the past
+  // wrote a start and reported success while the window stayed shut.
+  // The window check runs inside UPDATE_SCRIPT (atomic with the write; its
+  // behaviour is in admin-store.upstash.test.ts). Here: how a refusal reads.
+  it("updateAdminSettings: maps the script's window refusal to a validation error naming both bounds", async () => {
+    mocks.upstashEval.mockResolvedValue(["__window_refused__", "2030-06-01T00:00:00.000Z", "2000-01-01T00:00:00.000Z"]);
+    const err = await updateAdminSettings({ scoringStartsAt: "now" }, "a").catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(AdminValidationError);
+    expect(String((err as Error).message)).toMatch(/Scoring closes \(2000-01-01T00:00:00.000Z\) is at or before Scoring opens/);
+  });
+
+  // Both bounds in one patch need no stored value: refused before the script.
+  it("updateAdminSettings: refuses a patch whose own Scoring closes is at or before its start", async () => {
+    await expect(
+      updateAdminSettings({ scoringStartsAt: "2030-06-01T00:00:00.000Z", scoringEndsAt: "2030-01-01T00:00:00.000Z" }, "a"),
+    ).rejects.toThrow(/Scoring closes/);
+    expect(mocks.upstashEval).not.toHaveBeenCalled();
+  });
+
+  it("updateAdminSettings: \"now\" is a scoringStartsAt sentinel only", async () => {
+    await expect(updateAdminSettings({ scoringEndsAt: "now" }, "a")).rejects.toThrow();
+    await expect(updateAdminSettings({ scoringStartsAt: "later" }, "a")).rejects.toThrow();
   });
 
   it("updateAdminSettings: rejects an unparseable date", async () => {

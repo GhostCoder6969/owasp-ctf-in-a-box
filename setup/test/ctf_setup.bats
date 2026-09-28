@@ -466,14 +466,86 @@ EOF
     echo 'Missing doctor output: removed password-gate warning' >&2
     return 1
   fi
-  if ! printf '%s' "$output" | grep -qF -- 'set Scoring opens on the Event'; then
-    echo 'Missing doctor output: the Scoring opens launch guidance' >&2
+  if ! printf '%s' "$output" | grep -qF -- 'press Launch in /admin'; then
+    echo 'Missing doctor output: the Launch guidance' >&2
     return 1
   fi
   # The password itself must never be echoed back.
   [ -z "$(printf '%s' "$output" | grep -F -- 'open-sesame')" ]
   # Advisory: an inert key breaks nothing.
   [ "$status" -eq 0 ]
+}
+
+# #464: doctor reads the box's launch state from /health/deep (public). A
+# stubbed curl stands in for the box; gh fails so nothing org-scoped runs.
+doctor_with_box() {
+  printf 'GITHUB_ORG=\nADMIN_LOGINS=organizer\nSCORE_IMAGE=\nEVENT_URL=https://box.example\n' > .env
+  mkdir -p stubs
+  printf '#!/usr/bin/env bash\nexit 1\n' > stubs/gh
+  printf '#!/usr/bin/env bash\n%s\n' "$1" > stubs/curl
+  chmod +x stubs/gh stubs/curl
+  run env PATH="$BATS_TEST_TMPDIR/stubs:$PATH" NO_COLOR=1 bash "$SCRIPT" doctor
+}
+
+@test "doctor warns when the box reports it is not launched (#464)" {
+  doctor_with_box 'printf "%s" "{\"status\":\"ok\",\"redis\":\"ok\",\"launched\":false}"'
+  printf '%s' "$output" | grep -qF -- 'not launched'
+  printf '%s' "$output" | grep -qF -- 'press Launch in /admin'
+  [ "$status" -eq 0 ]
+}
+
+@test "doctor says nothing about the launch once the box reports launched" {
+  doctor_with_box 'printf "%s" "{\"status\":\"ok\",\"redis\":\"ok\",\"launched\":true}"'
+  [ "$status" -eq 0 ]
+  [ -z "$(printf '%s' "$output" | grep -F -- 'not launched')" ]
+}
+
+@test "doctor names an unreachable box once, neutrally, and does not fail" {
+  doctor_with_box 'exit 7'
+  printf '%s' "$output" | grep -qF -- "could not read the launch state"
+  [ "$status" -eq 0 ]
+}
+
+@test "doctor still reads the launch state from a degraded (503) box" {
+  # curl -f would treat the 503 as "unreachable"; the body still says launched:false.
+  # The stub behaves like real curl on a 503: exit 22 ONLY when asked to fail
+  # on HTTP errors (-f / -fsS), otherwise print the body and exit 0.
+  doctor_with_box 'for a in "$@"; do case "$a" in -f|-f?*) exit 22 ;; esac; done; printf "%s" "{\"status\":\"degraded\",\"redis\":\"ok\",\"scorer\":\"down\",\"launched\":false}"'
+  printf '%s' "$output" | grep -qF -- 'not launched'
+  [ "$status" -eq 0 ]
+}
+
+@test "doctor tolerates a space after the colon in the JSON" {
+  doctor_with_box 'printf "%s" "{\"status\": \"ok\", \"launched\": false}"'
+  printf '%s' "$output" | grep -qF -- 'not launched'
+  [ "$status" -eq 0 ]
+}
+
+@test "doctor says it could not read the launch state when the box reports null" {
+  doctor_with_box 'printf "%s" "{\"status\":\"ok\",\"redis\":\"ok\",\"launched\":null}"'
+  printf '%s' "$output" | grep -qF -- "could not read the launch state"
+  [ "$status" -eq 0 ]
+}
+
+@test "doctor --dry-run narrates the launch-state read and makes no box call" {
+  printf 'GITHUB_ORG=\nADMIN_LOGINS=organizer\nSCORE_IMAGE=\nEVENT_URL=https://box.example\n' > .env
+  mkdir -p stubs
+  printf '#!/usr/bin/env bash\nexit 1\n' > stubs/gh
+  printf '#!/usr/bin/env bash\necho CURL-CALLED\n' > stubs/curl
+  chmod +x stubs/gh stubs/curl
+  run env PATH="$BATS_TEST_TMPDIR/stubs:$PATH" NO_COLOR=1 bash "$SCRIPT" doctor --dry-run
+  printf '%s' "$output" | grep -qF -- 'DRY-RUN: would read the launch state from https://box.example/health/deep'
+  [ -z "$(printf '%s' "$output" | grep -F -- 'CURL-CALLED')" ]
+}
+
+@test "doctor makes no box call without an EVENT_URL" {
+  printf 'GITHUB_ORG=\nADMIN_LOGINS=organizer\nSCORE_IMAGE=\n' > .env
+  mkdir -p stubs
+  printf '#!/usr/bin/env bash\nexit 1\n' > stubs/gh
+  printf '#!/usr/bin/env bash\necho CURL-CALLED\n' > stubs/curl
+  chmod +x stubs/gh stubs/curl
+  run env PATH="$BATS_TEST_TMPDIR/stubs:$PATH" NO_COLOR=1 bash "$SCRIPT" doctor
+  [ -z "$(printf '%s' "$output" | grep -F -- 'CURL-CALLED')" ]
 }
 
 @test "doctor says nothing about the gate when no CHALLENGES_GATE_* key is set" {

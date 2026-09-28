@@ -32,7 +32,7 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { formatRelativeTime } from "@/lib/relative-time";
 import type { AdminSettings } from "@/lib/admin-store";
-import { nextScheduleBoundary } from "@/lib/schedule-window";
+import { restampPlan, type ReadoutStamp } from "@/lib/schedule-window";
 import { DEFAULT_EVENT_IDENTITY } from "@/lib/event-identity";
 import { phaseFromSettings } from "@/components/phase";
 import {
@@ -241,19 +241,42 @@ export default function AdminControls({
   // closes, so an organizer parked on the tab across a boundary sees the
   // flip without touching anything. Never read from the clock in render:
   // that is the impure read the compiler lint rejects.
-  const [settingsAt, setSettingsAt] = useState(() => Date.now());
+  const [stamp, setStamp] = useState<ReadoutStamp>(() => {
+    const now = Date.now();
+    return { at: now, client: now };
+  });
+  const settingsAt = stamp.at;
+  const restampNow = () => {
+    const now = Date.now();
+    setStamp({ at: now, client: now });
+  };
   useEffect(() => {
-    const at = nextScheduleBoundary(settingsAt, [
-      { startsAt: settings.scoringStartsAt, endsAt: settings.scoringEndsAt },
-      { startsAt: settings.registrationStartsAt, endsAt: settings.registrationEndsAt },
-    ]);
-    if (at === null) return;
+    // The same floored "now" the readouts use (serverFloorNow), so a client
+    // clock behind the server re-stamps at the boundary the READOUT crosses.
+    const plan = restampPlan(
+      stamp,
+      settings.updatedAt,
+      [
+        { startsAt: settings.scoringStartsAt, endsAt: settings.scoringEndsAt },
+        { startsAt: settings.registrationStartsAt, endsAt: settings.registrationEndsAt },
+      ],
+      Date.now(),
+    );
+    if (plan === null) return;
     // setState in a timer callback, not in the effect body: the clock is the
     // external system this effect subscribes to. Re-stamping re-runs the
-    // effect, which arms the timer for the following boundary, if any.
-    const id = setTimeout(() => setSettingsAt(Date.now()), Math.max(0, at - Date.now()));
+    // effect, which arms the timer for the following boundary, if any. The
+    // stamp is the boundary itself, never a client clock that may trail it.
+    const id = setTimeout(() => setStamp({ at: plan.stampAt, client: Date.now() }), plan.delayMs);
     return () => clearTimeout(id);
-  }, [settingsAt, settings.scoringStartsAt, settings.scoringEndsAt, settings.registrationStartsAt, settings.registrationEndsAt]);
+  }, [
+    stamp,
+    settings.updatedAt,
+    settings.scoringStartsAt,
+    settings.scoringEndsAt,
+    settings.registrationStartsAt,
+    settings.registrationEndsAt,
+  ]);
   const [hintCostInput, setHintCostInput] = useState(initial.hintCost === null ? "" : String(initial.hintCost));
   const [minSolvesInput, setMinSolvesInput] = useState(
     initial.hintsMinSolves === null ? "" : String(initial.hintsMinSolves),
@@ -406,10 +429,12 @@ export default function AdminControls({
       setError(data.error ?? "Reset failed");
       return;
     }
-    setSettings((s) => ({ ...s, paused: true }));
-    setSettingsAt(Date.now());
+    // The server reset freezes AND relocks (#464: clears the scoring start),
+    // so local state follows — or the Launch block would still say "Live".
+    setSettings((s) => ({ ...s, paused: true, scoringStartsAt: null }));
+    restampNow();
     const total = Object.values(data.cleared ?? {}).reduce((a, b) => a + b, 0);
-    setResetInfo(`Wiped ${total} keys — scoring is now frozen. Unfreeze when you're ready.`);
+    setResetInfo(`Wiped ${total} keys — the event is frozen and not launched. Launch and unfreeze when you're ready.`);
   };
 
   // No DEMO_MODE gate any more (issue #419): populate a demo leaderboard
@@ -468,7 +493,7 @@ export default function AdminControls({
    *  confirmed, so what the fields show is what is stored. */
   const syncInputs = (s: AdminSettings) => {
     setSettings(s);
-    setSettingsAt(Date.now());
+    restampNow();
     setHintCostInput(s.hintCost === null ? "" : String(s.hintCost));
     setMinSolvesInput(s.hintsMinSolves === null ? "" : String(s.hintsMinSolves));
     setUnlockAfterInput(s.hintsUnlockAfterMin === null ? "" : String(s.hintsUnlockAfterMin));

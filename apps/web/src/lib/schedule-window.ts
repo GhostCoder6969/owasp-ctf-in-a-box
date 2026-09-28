@@ -56,6 +56,18 @@ export function isLaunched(nowMs: number, startsAt: string | null): boolean {
   return Number.isFinite(s) && nowMs >= s;
 }
 
+/** The /admin Launch block's state (#464): not launched (no or an
+ *  unparseable start), scheduled (a start still ahead), or live (the start has
+ *  passed). Instants come back normalised to ISO-8601 UTC. */
+export type LaunchState = { kind: "not-launched" } | { kind: "scheduled"; at: string } | { kind: "live"; since: string };
+
+export function launchState(nowMs: number, startsAt: string | null): LaunchState {
+  const s = startsAt ? Date.parse(startsAt) : NaN;
+  if (!Number.isFinite(s)) return { kind: "not-launched" };
+  const iso = new Date(s).toISOString();
+  return nowMs < s ? { kind: "scheduled", at: iso } : { kind: "live", since: iso };
+}
+
 /** The next instant strictly after `nowMs` at which `outsideWindow` flips for
  *  any of `windows`, or null when no bound lies ahead. A start bound flips at
  *  the bound itself (`now < s` stops holding); an end bound flips one ms
@@ -76,4 +88,36 @@ export function nextScheduleBoundary(
     if (endsAt) consider(Date.parse(endsAt) + 1);
   }
   return next;
+}
+
+/** The /admin readouts' "now" (#464): the client's stamp, floored at the last
+ *  server instant it knows (the settings' `updatedAt`). A start is written on
+ *  the SERVER's clock, so a client clock behind it would otherwise show a
+ *  just-launched event as scheduled and its scoring as closed. */
+export function serverFloorNow(nowMs: number, updatedAt: string | null | undefined): number {
+  const floor = updatedAt ? Date.parse(updatedAt) : NaN;
+  return Number.isFinite(floor) ? Math.max(nowMs, floor) : nowMs;
+}
+
+/** A readout stamp: `at` on the floored timeline the readouts use, and
+ *  `client`, the client-clock instant it was taken at — the anchor elapsed
+ *  time is measured from, so the two clocks are never subtracted. */
+export type ReadoutStamp = { at: number; client: number };
+
+/** When the /admin boundary timer should fire and what to stamp (#464). The
+ *  delay is the distance to the next boundary on the floored timeline
+ *  (`serverFloorNow`), less the client time elapsed since the stamp's own
+ *  anchor. The new stamp IS the boundary, so a client clock behind the
+ *  server can neither fall back under the floor and re-arm the same boundary
+ *  nor add its skew to the next delay. Null when no bound lies ahead. */
+export function restampPlan(
+  stamp: ReadoutStamp,
+  updatedAt: string | null | undefined,
+  windows: readonly { startsAt: string | null | undefined; endsAt: string | null | undefined }[],
+  clientNow: number,
+): { delayMs: number; stampAt: number } | null {
+  const base = serverFloorNow(stamp.at, updatedAt);
+  const at = nextScheduleBoundary(base, windows.map((w) => ({ startsAt: w.startsAt ?? null, endsAt: w.endsAt ?? null })));
+  if (at === null) return null;
+  return { delayMs: Math.max(0, at - base - (clientNow - stamp.client)), stampAt: at };
 }

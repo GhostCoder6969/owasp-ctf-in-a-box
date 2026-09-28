@@ -397,8 +397,10 @@ function decodeEnabledModuleIds(raw: string | undefined): ModuleId[] | null {
   return ids.length > 0 ? [...new Set(ids)] : null;
 }
 
-export async function getAdminSettings(): Promise<AdminSettings> {
-  const [res] = await upstashPipeline([["HGETALL", ADMIN_SETTINGS_KEY]]);
+/** `timeoutMs` bounds the read itself (the pipeline's default otherwise) —
+ *  the public /health/deep probe passes its own deadline (#464). */
+export async function getAdminSettings(timeoutMs?: number): Promise<AdminSettings> {
+  const [res] = await upstashPipeline([["HGETALL", ADMIN_SETTINGS_KEY]], timeoutMs === undefined ? undefined : { timeoutMs });
   // A command-level failure resolves as { error } rather than rejecting.
   // Decoding its missing result would silently serve DEFAULT settings (not
   // paused, baked caps) with no log — so throw, making it behave exactly
@@ -430,12 +432,39 @@ export async function getSyncStatus(): Promise<SyncStatus | null> {
 //       [6 .. 5+numDels]=field names to HDEL  [6+numDels ..]=field,value pairs to HSET
 const UPDATE_SCRIPT = `
 local numDels = tonumber(ARGV[5])
+-- The scoring window must be able to open (#464). Checked here, atomically
+-- with the write, on the RESULTING bounds: this patch's value for a bound it
+-- sets or clears, else the stored one. Stored bounds are normalised ISO-8601
+-- UTC strings, so string order is time order. Only when the patch touches a
+-- bound: an unrelated save is never refused over a window it does not touch.
+local touched, startV, endV = false, nil, nil
+local startSet, endSet = false, false
+for i = 1, numDels do
+  if ARGV[5 + i] == 'scoringStartsAt' then touched = true; startSet = true end
+  if ARGV[5 + i] == 'scoringEndsAt' then touched = true; endSet = true end
+end
+for i = 6 + numDels, #ARGV, 2 do
+  if ARGV[i] == 'scoringStartsAt' then touched = true; startSet = true; startV = ARGV[i+1] end
+  if ARGV[i] == 'scoringEndsAt' then touched = true; endSet = true; endV = ARGV[i+1] end
+end
+if touched then
+  if not startSet then startV = redis.call('HGET', KEYS[1], 'scoringStartsAt') or nil end
+  if not endSet then endV = redis.call('HGET', KEYS[1], 'scoringEndsAt') or nil end
+  if startV and endV and endV <= startV then return {'__window_refused__', startV, endV} end
+end
 redis.call('HSET', KEYS[1], 'updatedBy', ARGV[1], 'updatedAt', ARGV[2])
 for i = 1, numDels do redis.call('HDEL', KEYS[1], ARGV[5 + i]) end
 for i = 6 + numDels, #ARGV, 2 do redis.call('HSET', KEYS[1], ARGV[i], ARGV[i+1]) end
 redis.call('LPUSH', KEYS[2], ARGV[3])
 redis.call('LTRIM', KEYS[2], 0, tonumber(ARGV[4]))
 return redis.call('HGETALL', KEYS[1])`;
+
+function windowRefusal(start: string, end: string): AdminValidationError {
+  return new AdminValidationError(
+    "scoringEndsAt",
+    `Scoring closes (${end}) is at or before Scoring opens (${start}), so scoring could never open — clear or move Scoring closes first`,
+  );
+}
 
 export async function updateAdminSettings(patch: SettingsPatch, actor: string): Promise<AdminSettings> {
   const keys = Object.keys(patch);
@@ -547,7 +576,10 @@ export async function updateAdminSettings(patch: SettingsPatch, actor: string): 
         changed[k] = null as unknown as boolean;
       } else {
         if (typeof v !== "string") throw new AdminValidationError(k, `${k} must be an ISO date string or null`);
-        const ms = Date.parse(v);
+        // #464 Launch now: "now" means THIS server's clock, so an organizer's
+        // skewed laptop clock can never launch into the future. The one
+        // sentinel, and only for the scoring start.
+        const ms = k === "scoringStartsAt" && v === "now" ? Date.now() : Date.parse(v);
         if (!Number.isFinite(ms)) throw new AdminValidationError(k, `${k} must be a valid ISO date string`);
         const iso = new Date(ms).toISOString();
         fields.push(k, iso);
@@ -662,6 +694,15 @@ export async function updateAdminSettings(patch: SettingsPatch, actor: string): 
       throw new AdminValidationError(k, `unknown setting: ${k}`);
     }
   }
+
+  // Both bounds in this one patch: refused here, before any write. A single
+  // bound is checked against the stored other one inside UPDATE_SCRIPT,
+  // atomically with the write, so two organizers cannot race past it.
+  const patchedStart = changed.scoringStartsAt as unknown;
+  const patchedEnd = changed.scoringEndsAt as unknown;
+  if (typeof patchedStart === "string" && typeof patchedEnd === "string" && Date.parse(patchedEnd) <= Date.parse(patchedStart)) {
+    throw windowRefusal(patchedStart, patchedEnd);
+  }
   const at = new Date().toISOString();
   const audit = JSON.stringify({ at, by: actor, changed });
   const result = await upstashEval(
@@ -669,6 +710,8 @@ export async function updateAdminSettings(patch: SettingsPatch, actor: string): 
     [ADMIN_SETTINGS_KEY, ADMIN_AUDIT_KEY],
     [actor, at, audit, String(AUDIT_CAP - 1), String(dels.length), ...dels, ...fields],
   );
+  // The script refused a window that could never open, writing nothing.
+  if (Array.isArray(result) && result[0] === "__window_refused__") throw windowRefusal(String(result[1]), String(result[2]));
   return decodeSettings(flatToObject(result));
 }
 
@@ -781,11 +824,15 @@ async function scanDelByPrefix(pattern: string): Promise<number> {
 }
 
 // Freeze scoring, bump the reset epoch (sync reads `resetAt` and clears its
-// cursor when it advances — the poll-mode re-ingest fix), and append the audit
-// record. One atomic script so a reset can never land without its audit line.
+// cursor when it advances — the poll-mode re-ingest fix), RELOCK the event
+// (clear the scoring start, #464: a reset event is not launched until an
+// organizer launches it again), and append the audit record. One atomic script
+// so a reset can never land without its audit line. Exported for the live
+// suite only.
 // ARGV: [1]=actor [2]=at [3]=resetAt [4]=auditLine [5]=cap-1
-const RESET_SCRIPT = `
+export const RESET_SCRIPT = `
 redis.call('HSET', KEYS[1], 'paused', '1', 'resetAt', ARGV[3], 'updatedBy', ARGV[1], 'updatedAt', ARGV[2])
+redis.call('HDEL', KEYS[1], 'scoringStartsAt')
 redis.call('LPUSH', KEYS[2], ARGV[4])
 redis.call('LTRIM', KEYS[2], 0, tonumber(ARGV[5]))`;
 

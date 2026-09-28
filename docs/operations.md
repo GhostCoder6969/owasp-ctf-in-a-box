@@ -598,7 +598,8 @@ The panel offers:
   name from the Identity section above, not a fixed default — to proceed (a
   single click can't fire it).
 
-  The reset also **freezes scoring** and bumps a reset epoch that the sync poller
+  The reset also **returns the event to not launched** (it clears Scoring
+  opens, #464 — launch again when ready), **freezes scoring** and bumps a reset epoch that the sync poller
   honours by dropping its cursor. This is what makes a reset stick in **poll
   mode**: without it, the poller would re-ingest the same PR comments within a
   cycle and undo the wipe. So the intended flow is *reset → box is frozen →
@@ -1015,7 +1016,10 @@ repeat run of the same CTF renames itself without a rebuild. The bundle's
 export for the record — see above) and are **not** reapplied on import: both
 are derived from the **Scoring opens** / **Scoring closes** schedule, which an
 organizer sets for the new run on the Event tab, so importing a bundle never
-overwrites this event's actual dates. **Contact e-mail and Discord
+writes this event's dates from the file. The import's reset does **clear
+Scoring opens**, though, exactly like a master reset (#464): an imported
+event is **not launched** until an organizer launches it again, so set or
+press Launch once the new run is ready. **Contact e-mail and Discord
 invite are deliberately left
 out of the bundle**, even though both are runtime settings too: they are
 organizer PII (a private inbox, an invite link), not needed to replay the
@@ -1725,7 +1729,8 @@ any browser or phone, no login:
   deployed? Compare `revision` to the commit you expect.
 - `<EVENT_URL>/health/deep` — can it score? `200` with every
   dependency `"ok"` is the answer you want; `503` names which of `redis` or
-  `scorer` is `"down"`. `sync.ageSec` is how long since the poller last
+  `scorer` is `"down"`. `launched` says whether the event has launched (#464)
+  — `null` when the settings couldn't be read; it never fails the check. `sync.ageSec` is how long since the poller last
   polled — if that number keeps growing while Secure Development is live,
   score comments are piling up on GitHub and the leaderboard is not moving.
 
@@ -2033,12 +2038,23 @@ before kickoff), so if the settings read fails, a non-admin is treated as
 an admin. The manual scoring **freeze** read is a different decision and
 still fails open — a Redis blip must not drop live submissions.
 
-**Launching.** Set **Scoring opens** on the `/admin` Event tab: to a time in
-the future to schedule the launch (the landing page counts down to it and
-the lock lifts on its own), or to now to launch immediately. **Un-launching**
-is clearing the field — the event is then not launched again, the module
-pages redirect, and nothing scores. A Launch/Schedule/Un-launch button in
-`/admin` is planned; until then the field is the control. If contestants
+**Launching.** The `/admin` Event tab opens with a **Launch** block that
+shows the event's state: **Not launched**, **Scheduled for …** or **Live
+since …**.
+- **Launch now** (with a confirmation) starts the event on the *server's*
+  clock, so a laptop with a skewed clock can't launch it into the future.
+- **To schedule**, set **Scoring opens** to a future time. The landing page
+  counts down to it, and the lock lifts on its own.
+- A window that could never open is refused, with the field to fix named:
+  **Launch now** or a scheduled start at or after **Scoring closes**, or a
+  Scoring closes moved to before the start. A Scoring closes left over from
+  an earlier run is the usual cause — clear it first.
+- **Un-launch**, shown once live and confirmed as a dangerous action, locks
+  every module page again and stops scoring. Solves already banked are kept.
+
+A **master reset** also returns the event to not launched. Launch state is
+public on `/health/deep` (`"launched": true | false | null`, where `null` means the box could not read its settings). `ctf-setup.sh doctor`
+reads it and warns while the box is not launched. If contestants
 report that only the landing page loads, this is almost always why — see
 [troubleshooting](troubleshooting.md).
 

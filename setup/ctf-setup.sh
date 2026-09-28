@@ -429,9 +429,41 @@ cmd_doctor() {
   if [ -n "$(env_val CHALLENGES_GATE_ENABLED)" ] || [ -n "$(env_val CHALLENGES_GATE_PASSWORD)" ]; then
     printf '%s⚠️  %s sets CHALLENGES_GATE_ENABLED / CHALLENGES_GATE_PASSWORD — the password gate is REMOVED (#464) and the keys are no longer read.%s\n' \
       "$C_YELLOW" "${OUT:-.env}" "$C_RESET"
-    printf '    The event is locked until you launch it: set Scoring opens on the Event\n'
-    printf '    tab in /admin. Delete both lines.\n\n'
+    printf '    The event is locked until you launch it: press Launch in /admin → Event, or\n'
+    printf '    set Scoring opens there. Delete both lines.\n\n'
   fi
+  # Every event needs an official launch (#464): until then contestants see
+  # the landing page only and nothing scores. Asked of the box itself (the
+  # public /health/deep carries `launched`), and only when this .env names the
+  # box. Advisory like the notices above: a box that is not launched YET is
+  # the normal state before kickoff, and an unreachable one is named once,
+  # neutrally — doctor is not a monitor.
+  local event_url; event_url="$(env_val EVENT_URL)"
+  if [ -n "$event_url" ] && [ "$DRY_RUN" -eq 1 ]; then
+    printf 'DRY-RUN: would read the launch state from %s/health/deep\n\n' "${event_url%/}"
+  elif [ -n "$event_url" ]; then
+    # No -f: /health/deep answers 503 when a dependency is down, and that body
+    # still carries `launched`. Only a transport failure means "unreadable".
+    # The key is matched with or without a space after the colon, and a
+    # `null` (the box could not read its own settings) is named as unreadable.
+    local deep deep_compact
+    if deep="$(curl -sS --max-time 5 "${event_url%/}/health/deep" 2>/dev/null)"; then
+      deep_compact="$(printf '%s' "$deep" | tr -d ' ')"
+      case "$deep_compact" in
+        *'"launched":false'*)
+          printf '%s⚠️  %s is not launched — contestants see the landing page only and nothing scores.%s\n' "$C_YELLOW" "$event_url" "$C_RESET"
+          printf '    When you are ready: press Launch in /admin → Event (or set Scoring opens).\n\n'
+          ;;
+        *'"launched":true'*) ;;
+        *)
+          printf 'ℹ️  could not read the launch state from %s/health/deep (the box could not read its settings).\n\n' "${event_url%/}"
+          ;;
+      esac
+    else
+      printf 'ℹ️  could not read the launch state from %s/health/deep (box down, or not deployed yet).\n\n' "${event_url%/}"
+    fi
+  fi
+
   # Nothing org-scoped left to inspect without an org: SD-on already failed
   # loudly above; SD-off simply has nothing further to check here.
   [ -n "$org" ] || return $rc
