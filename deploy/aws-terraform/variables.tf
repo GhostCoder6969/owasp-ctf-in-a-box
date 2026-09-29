@@ -143,6 +143,51 @@ variable "admin_logins" {
   }
 }
 
+variable "github_client_id" {
+  description = "The GitHub OAuth app's client id (public; its secret goes in SSM as GITHUB_CLIENT_SECRET). REQUIRED: the app signs every contestant in with it (apps/web/src/lib/auth.ts)."
+  type        = string
+  default     = ""
+
+  // A client id is not a secret (GitHub shows it on every authorize URL), so
+  // it travels as a plain environment value like github_org. Without it the
+  // stack applies cleanly and then no one can sign in.
+  validation {
+    condition     = trimspace(var.github_client_id) != ""
+    error_message = "github_client_id must be the GitHub OAuth app's client id: without it no one can sign in."
+  }
+}
+
+variable "github_app_id" {
+  description = "The numeric id of the GitHub App sync polls with (its private key goes in SSM as GITHUB_APP_PRIVATE_KEY). Required whenever enable_secure_development is true: sync/src/config.js exits at start-up without it."
+  type        = string
+  default     = ""
+
+  validation {
+    condition     = !var.enable_secure_development || trimspace(var.github_app_id) != ""
+    error_message = "github_app_id must name the GitHub App sync polls with when Secure Development is enabled: sync exits at start-up without one."
+  }
+
+  // An App id is a number. A non-numeric one reached sync as a string it
+  // could never authenticate with.
+  validation {
+    condition     = var.github_app_id == "" || can(regex("^[1-9][0-9]*$", var.github_app_id))
+    error_message = "github_app_id must be the App's numeric id (a positive integer), e.g. \"123456\"."
+  }
+}
+
+variable "github_app_installation_id" {
+  description = "The GitHub App's installation id on github_org. Optional: when empty, sync picks the App's installation on github_org itself, and refuses to start polling if the App is not installed there."
+  type        = string
+  default     = ""
+
+  // Empty is legal (sync finds the installation on github_org); anything else
+  // must be a number, or sync refuses to start (sync/src/config.js).
+  validation {
+    condition     = var.github_app_installation_id == "" || can(regex("^[1-9][0-9]*$", var.github_app_installation_id))
+    error_message = "github_app_installation_id must be empty (sync finds the installation on github_org) or a positive integer."
+  }
+}
+
 variable "enable_secure_development" {
   description = "This event runs the secure-development module (GitHub forks + PR scoring). When false, no scorer and no sync run at all — the compose profiles' behaviour, ported."
   type        = bool

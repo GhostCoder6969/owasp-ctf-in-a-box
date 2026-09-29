@@ -9,8 +9,9 @@
 // it and nothing else does, so a quiz-only event brings up neither and never
 // needs the scorer image at all.
 //
-// Service discovery is AWS Cloud Map, so the app reaches srh at a stable name
-// the way compose gave it one. Without it the app would need an address for a
+// Service discovery is AWS Cloud Map, so the app reaches srh (and, on a
+// Secure Development event, the scorer) at a stable name the way compose gave
+// it one. Without it the app would need an address for a
 // task that is replaced on every deploy.
 
 resource "aws_ecs_cluster" "main" {
@@ -30,6 +31,26 @@ resource "aws_service_discovery_private_dns_namespace" "main" {
 
 resource "aws_service_discovery_service" "srh" {
   name = "srh"
+
+  dns_config {
+    namespace_id = aws_service_discovery_private_dns_namespace.main.id
+
+    dns_records {
+      ttl  = 10
+      type = "A"
+    }
+
+    routing_policy = "MULTIVALUE"
+  }
+}
+
+// The scorer's name, for its two callers: sync submits scores to it and the
+// app reads the leaderboard and challenge catalogue from it. Compose gives it
+// `scorer:4000`; this is that name, ported.
+resource "aws_service_discovery_service" "scorer" {
+  count = local.run_scorer ? 1 : 0
+
+  name = "scorer"
 
   dns_config {
     namespace_id = aws_service_discovery_private_dns_namespace.main.id
@@ -64,6 +85,9 @@ locals {
   // meaningful.
   upstash_url = "http://${local.srh_host}"
 
+  // The scorer's serve port (scorer/src/serve.js, PORT unset).
+  scorer_url = "http://scorer.${aws_service_discovery_private_dns_namespace.main.name}:4000"
+
   // Every secret arrives by reference. Nothing here interpolates a secret
   // value into an environment variable, where it would sit in the task
   // definition — readable by anyone holding ecs:DescribeTaskDefinition.
@@ -82,9 +106,19 @@ locals {
     { name = "UPSTASH_REDIS_REST_TOKEN", valueFrom = "${local.secret_arn_prefix}/SRH_TOKEN" },
   ]
 
-  worker_secrets = [
+  // One SCORER_TOKEN, two readers: the scorer checks it on every POST /score
+  // and sync presents it (compose passes the same value to both).
+  scorer_secrets = [
     { name = "UPSTASH_REDIS_REST_TOKEN", valueFrom = "${local.secret_arn_prefix}/SRH_TOKEN" },
-    { name = "GITHUB_TOKEN", valueFrom = "${local.secret_arn_prefix}/GITHUB_TOKEN" },
+    { name = "CTF_SCORE_BEARER_TOKEN", valueFrom = "${local.secret_arn_prefix}/SCORER_TOKEN" },
+  ]
+
+  // sync authenticates to GitHub as an App (sync/src/config.js), not with a
+  // PAT: the key is the base64 PEM that file decodes.
+  sync_secrets = [
+    { name = "UPSTASH_REDIS_REST_TOKEN", valueFrom = "${local.secret_arn_prefix}/SRH_TOKEN" },
+    { name = "SCORER_TOKEN", valueFrom = "${local.secret_arn_prefix}/SCORER_TOKEN" },
+    { name = "GITHUB_APP_PRIVATE_KEY", valueFrom = "${local.secret_arn_prefix}/GITHUB_APP_PRIVATE_KEY" },
   ]
 
   log_configuration = {
@@ -202,7 +236,7 @@ resource "aws_ecs_task_definition" "app" {
 
     portMappings = [{ containerPort = 3000, protocol = "tcp" }]
 
-    environment = [
+    environment = concat([
       { name = "NODE_ENV", value = "production" },
       // Read by BETTER_AUTH_URL, the HTTPS start-up guard and the CSRF origin
       // check. It differs per deployment, which is why it is not baked.
@@ -219,7 +253,18 @@ resource "aws_ecs_task_definition" "app" {
       // SCORE_IMAGE travels above.
       { name = "GITHUB_ORG", value = var.github_org },
       { name = "ADMIN_LOGINS", value = var.admin_logins },
-    ]
+      // The OAuth client id is public; its secret is in app_secrets.
+      { name = "GITHUB_CLIENT_ID", value = var.github_client_id },
+      // Unset, the board serves the mock fixture (leaderboard/source.ts);
+      // compose sets the same pair. With Secure Development off the source
+      // resolves to "empty" whatever this says, so it can stay constant.
+      { name = "LEADERBOARD_SOURCE", value = "lambda" },
+      // Teams are refused unless this is exactly "true" (team-store.ts).
+      { name = "TEAM_WRITES_ENABLED", value = "true" },
+      ], local.run_scorer ? [
+      // Only when a scorer exists to answer it.
+      { name = "LEADERBOARD_API_URL", value = local.scorer_url },
+    ] : [])
 
     secrets = local.app_secrets
 
@@ -276,11 +321,13 @@ resource "aws_ecs_task_definition" "scorer" {
     image     = var.scorer_image
     essential = true
 
+    portMappings = [{ containerPort = 4000, protocol = "tcp" }]
+
     environment = [
       { name = "UPSTASH_REDIS_REST_URL", value = local.upstash_url },
     ]
 
-    secrets          = local.worker_secrets
+    secrets          = local.scorer_secrets
     logConfiguration = local.log_configuration["scorer"]
   }])
 }
@@ -296,8 +343,12 @@ resource "aws_ecs_service" "scorer" {
 
   network_configuration {
     subnets          = aws_subnet.public[*].id
-    security_groups  = [aws_security_group.worker.id]
+    security_groups  = [aws_security_group.scorer[0].id]
     assign_public_ip = true
+  }
+
+  service_registries {
+    registry_arn = aws_service_discovery_service.scorer[0].arn
   }
 
   depends_on = [aws_ecs_service.srh]
@@ -326,9 +377,13 @@ resource "aws_ecs_task_definition" "sync" {
       // sync refuses to start without this (sync/src/config.js) — it decides
       // which org's PRs it polls, unlike the app's fallback to bare repo names.
       { name = "GITHUB_ORG", value = var.github_org },
+      { name = "GITHUB_APP_ID", value = var.github_app_id },
+      { name = "GITHUB_APP_INSTALLATION_ID", value = var.github_app_installation_id },
+      // Compose's `scorer:4000` does not resolve here; the Cloud Map name does.
+      { name = "SCORER_URL", value = local.scorer_url },
     ]
 
-    secrets          = local.worker_secrets
+    secrets          = local.sync_secrets
     logConfiguration = local.log_configuration["sync"]
   }])
 }

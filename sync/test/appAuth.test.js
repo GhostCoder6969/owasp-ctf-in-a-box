@@ -84,6 +84,39 @@ test("getToken discovers the installation id when not configured", async () => {
   assert.ok(fetchImpl.calls.some((c) => c.url.endsWith("/app/installations")));
 });
 
+// Review (#479): an App installed on several orgs used to hand back the
+// FIRST installation's token, which polls nothing when that one is not the
+// event's org. With an org, discovery asks GitHub for THAT org's installation
+// directly (GET /orgs/{org}/installation), so the answer does not depend on
+// the /app/installations list, which pages at 30.
+test("getToken asks for the event org's own installation, never the first listed", async () => {
+  const auth = makeAppAuth({ appId: "1", privateKey, org: "Event-Org", apiUrl: "https://api.github.test" });
+  const fetchImpl = stubFetch([
+    ["/app/installations/22/access_tokens", () => jsonRes(201, { token: "event-tok", expires_at: "2033-11-14T00:00:00Z" })],
+    ["/orgs/Event-Org/installation", (opts) => {
+      assert.match(opts.headers.authorization, /^Bearer .+\..+\..+$/); // the App JWT
+      return jsonRes(200, { id: 22, account: { login: "Event-Org" } });
+    }],
+    ["/app/installations", () => jsonRes(200, [{ id: 11, account: { login: "other-org" } }])],
+  ]);
+  assert.equal(await auth.getToken(fetchImpl, 1_700_000_000_000), "event-tok");
+  // The list (and with it its first page of 30) is never consulted.
+  assert.ok(!fetchImpl.calls.some((c) => c.url.endsWith("/app/installations")));
+});
+
+test("getToken refuses when the App is not installed on the event's org", async () => {
+  const auth = makeAppAuth({ appId: "1", privateKey, org: "event-org", apiUrl: "https://api.github.test" });
+  const fetchImpl = stubFetch([["/orgs/event-org/installation", () => jsonRes(404, { message: "Not Found" })]]);
+  await assert.rejects(() => auth.getToken(fetchImpl, 1_700_000_000_000), /not installed on event-org.*GITHUB_APP_INSTALLATION_ID/);
+  assert.ok(!fetchImpl.calls.some((c) => c.url.includes("access_tokens")));
+});
+
+test("getToken with no org refuses to guess between several installations", async () => {
+  const auth = makeAppAuth({ appId: "1", privateKey, apiUrl: "https://api.github.test" });
+  const fetchImpl = stubFetch([["/app/installations", () => jsonRes(200, [{ id: 11, account: { login: "a" } }, { id: 22, account: { login: "b" } }])]]);
+  await assert.rejects(() => auth.getToken(fetchImpl, 1_700_000_000_000), /2 installations.*GITHUB_APP_INSTALLATION_ID/);
+});
+
 // new Date("garbage").getTime() is NaN, and `NaN - now > skew` is always false
 // — so a token with an unusable expiry would be re-minted on EVERY call,
 // silently. A malformed expiry is a broken response; say so.

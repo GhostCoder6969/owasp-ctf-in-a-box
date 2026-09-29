@@ -11,6 +11,8 @@
 //     app        -> srh        :80
 //     scorer     -> srh        :80
 //     sync       -> srh        :80
+//     app        -> scorer     :4000   (leaderboard, challenge catalogue)
+//     sync       -> scorer     :4000   (POST /score)
 //     srh        -> elasticache:6379
 //
 // and nothing else. In particular THE APP HAS NO PATH TO ELASTICACHE. That is
@@ -55,9 +57,25 @@ resource "aws_security_group" "srh" {
   }
 }
 
+// The scorer has its own group rather than sharing sync's: it takes inbound
+// on :4000 from the app and from sync, and a rule on a shared group would let
+// the scorer reach sync too. sync stays outbound only.
+resource "aws_security_group" "scorer" {
+  count = local.run_scorer ? 1 : 0
+
+  name_prefix = "${var.name}-scorer-"
+  description = "The scorer. Reachable on :4000 from the app and sync only."
+  vpc_id      = aws_vpc.main.id
+  tags        = { Name = "${var.name}-scorer" }
+
+  lifecycle {
+    create_before_destroy = true
+  }
+}
+
 resource "aws_security_group" "worker" {
   name_prefix = "${var.name}-worker-"
-  description = "scorer and sync. Outbound only; nothing may reach them."
+  description = "sync. Outbound only; nothing may reach it."
   vpc_id      = aws_vpc.main.id
   tags        = { Name = "${var.name}-worker" }
 
@@ -122,10 +140,43 @@ resource "aws_vpc_security_group_ingress_rule" "srh_from_app" {
 
 resource "aws_vpc_security_group_ingress_rule" "srh_from_worker" {
   security_group_id            = aws_security_group.srh.id
-  description                  = "scorer/sync -> srh (Upstash REST)"
+  description                  = "sync -> srh (Upstash REST)"
   ip_protocol                  = "tcp"
   from_port                    = 80
   to_port                      = 80
+  referenced_security_group_id = aws_security_group.worker.id
+}
+
+resource "aws_vpc_security_group_ingress_rule" "srh_from_scorer" {
+  count = local.run_scorer ? 1 : 0
+
+  security_group_id            = aws_security_group.srh.id
+  description                  = "scorer -> srh (Upstash REST)"
+  ip_protocol                  = "tcp"
+  from_port                    = 80
+  to_port                      = 80
+  referenced_security_group_id = aws_security_group.scorer[0].id
+}
+
+resource "aws_vpc_security_group_ingress_rule" "scorer_from_app" {
+  count = local.run_scorer ? 1 : 0
+
+  security_group_id            = aws_security_group.scorer[0].id
+  description                  = "app -> scorer (leaderboard, challenge catalogue)"
+  ip_protocol                  = "tcp"
+  from_port                    = 4000
+  to_port                      = 4000
+  referenced_security_group_id = aws_security_group.app.id
+}
+
+resource "aws_vpc_security_group_ingress_rule" "scorer_from_sync" {
+  count = local.run_scorer ? 1 : 0
+
+  security_group_id            = aws_security_group.scorer[0].id
+  description                  = "sync -> scorer (POST /score)"
+  ip_protocol                  = "tcp"
+  from_port                    = 4000
+  to_port                      = 4000
   referenced_security_group_id = aws_security_group.worker.id
 }
 
@@ -172,9 +223,18 @@ resource "aws_vpc_security_group_egress_rule" "srh_all" {
   cidr_ipv4         = "0.0.0.0/0"
 }
 
+resource "aws_vpc_security_group_egress_rule" "scorer_all" {
+  count = local.run_scorer ? 1 : 0
+
+  security_group_id = aws_security_group.scorer[0].id
+  description       = "ECR, SSM, logs, srh"
+  ip_protocol       = "-1"
+  cidr_ipv4         = "0.0.0.0/0"
+}
+
 resource "aws_vpc_security_group_egress_rule" "worker_all" {
   security_group_id = aws_security_group.worker.id
-  description       = "ECR, Secrets Manager, logs, srh, GitHub"
+  description       = "ECR, SSM, logs, srh, the scorer, GitHub"
   ip_protocol       = "-1"
   cidr_ipv4         = "0.0.0.0/0"
 }

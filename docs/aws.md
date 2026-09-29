@@ -44,8 +44,9 @@ Two things did **not** change:
   connects *to*. Everything above it is the same code as compose.
 - **The isolation is still in the security groups.** ADR 41 put the boundary
   there rather than in the network topology, and it stays: only the ALB reaches
-  the app, only the app and workers reach `srh`, and only `srh` reaches
-  ElastiCache. The app has no route to Redis at all.
+  the app, only the app, sync and the scorer reach `srh`, only the app and
+  sync reach the scorer (`:4000`), and only `srh` reaches ElastiCache. The app has no
+  route to Redis at all.
 
 What it costs is the honest tradeoff, and the module README
 [itemises it](https://github.com/OWASP/owasp-ctf-in-a-box/tree/main/deploy/aws-terraform#what-it-costs):
@@ -80,7 +81,7 @@ that step 3's secrets are encrypted with. One targeted apply creates both.
 
 ```sh
 cd deploy/aws-terraform
-cp terraform.tfvars.example terraform.tfvars    # edit: domain, github_org, admin_logins
+cp terraform.tfvars.example terraform.tfvars    # edit: domain, github_org, admin_logins, github_client_id, github_app_id
 terraform init
 terraform apply \
   -target=aws_ecr_repository.main \
@@ -97,7 +98,8 @@ Afterwards a redeploy is one command:
 ```
 
 Terraform creates the VPC (two AZs; a public tier for the ALB and tasks, a
-private tier for ElastiCache alone), the five security groups above, the
+private tier for ElastiCache alone), the security groups above (five, plus
+the scorer's own on a Secure Development event), the
 ElastiCache replication group with in-transit encryption and an AUTH token it
 generates for you, the ALB with its ACM certificate, the ECR repository, and the
 Fargate services for whichever modules this event runs — a quiz-only event
@@ -109,10 +111,14 @@ build-time configuration at all (config v2, #386): `github_org` and
 path's equivalent of the wizard's `.env` — and mirrored into the app's
 task-definition environment the same way `scorer_image` is. Change either and
 `terraform apply` rolls it out; nothing has to be rebuilt or repushed.
-`admin_logins` must name at least one login, and `github_org` is required
-whenever `enable_secure_development` is true: `sync` exits at startup without
-one, and the app would build fork links with no org to point them at. Both are
-refused at plan time, not at apply.
+`admin_logins` must name at least one login and `github_client_id` must be the
+OAuth app's client id (without it no one can sign in). `github_org` and
+`github_app_id` are required whenever `enable_secure_development` is true:
+`sync` authenticates as a GitHub App and exits at startup without either. All
+of these are refused at plan time, not at apply. The Secure Development
+secrets in SSM are the App's private key (`GITHUB_APP_PRIVATE_KEY`, base64 of
+the `.pem`) and the scorer's bearer token (`SCORER_TOKEN`), which the scorer
+and sync share.
 
 The image tag is content-addressed to the git revision, and ECR is set to
 immutable tags, so re-running with nothing changed reports "already there" and
@@ -175,7 +181,10 @@ terraform destroy
   `mock_provider` — no AWS credentials, no network — and assert that only `srh`
   may reach ElastiCache, that the cache connection is `rediss://`, that no
   secret is baked in as plaintext, and that scorer and sync appear only for the
-  modules the event runs. `deploy.sh` has its own bats suite for the half
+  modules the event runs. One run reads `docker-compose.yml` and fails if an
+  environment key compose gives the app, the scorer or sync is missing from
+  its ECS task: that gap once left this stack with no sign-in and no scoring
+  (#476). `deploy.sh` has its own bats suite for the half
   Terraform cannot see.
 - Kubernetes is tracked separately (Helm chart,
   [issue #54](https://github.com/OWASP/owasp-ctf-in-a-box/issues/54)).

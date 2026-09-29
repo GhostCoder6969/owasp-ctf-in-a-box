@@ -105,7 +105,10 @@ that can replace a task without dropping the event.
    aws ssm put-parameter --type SecureString --key-id $K --name $P/BETTER_AUTH_SECRET   --value "$(openssl rand -base64 32)"
    aws ssm put-parameter --type SecureString --key-id $K --name $P/SRH_TOKEN            --value "$(openssl rand -hex 24)"
    aws ssm put-parameter --type SecureString --key-id $K --name $P/GITHUB_CLIENT_SECRET --value "..."
-   aws ssm put-parameter --type SecureString --key-id $K --name $P/GITHUB_TOKEN         --value "..."   # secure-development only
+   # Secure Development only: the GitHub App's key (base64 of the .pem, as
+   # sync/src/config.js decodes it) and the scorer's bearer token.
+   aws ssm put-parameter --type SecureString --key-id $K --name $P/GITHUB_APP_PRIVATE_KEY --value "$(base64 < app.private-key.pem | tr -d '\n')"
+   aws ssm put-parameter --type SecureString --key-id $K --name $P/SCORER_TOKEN           --value "$(openssl rand -hex 24)"
    ```
 
    **`--key-id` is not optional.** The stack creates one customer-managed KMS
@@ -131,7 +134,7 @@ Both are created by one targeted apply:
 
 ```sh
 cd deploy/aws-terraform
-cp terraform.tfvars.example terraform.tfvars    # then edit: domain, github_org, admin_logins
+cp terraform.tfvars.example terraform.tfvars    # then edit: domain, github_org, admin_logins, github_client_id, github_app_id
 terraform init
 terraform apply \
   -target=aws_ecr_repository.main \
@@ -176,12 +179,13 @@ registry, would have redeployed the earlier image. `deploy.sh --dry-run` prints 
 ## Variables
 
 Every input is in `variables.tf` with its own description;
-`terraform.tfvars.example` shows each at its default. Three are required:
+`terraform.tfvars.example` shows each at its default. Four are required:
 
 | Variable | Why it is required |
 |---|---|
 | `domain` | The session cookie is `Secure`. There is no working HTTP mode. |
 | `app_image` | What ECS runs. `deploy.sh` writes it into `image.auto.tfvars`; the example carries a placeholder for the bootstrap apply. |
+| `github_client_id` | The GitHub OAuth app's client id (public; the secret is `GITHUB_CLIENT_SECRET` in SSM). Without it no one can sign in. |
 | `admin_logins` | The `/admin` allowlist. Its `validation` block refuses a roster with no login at plan time — empty, or nothing but separators like `" , "` — because that would forbid everyone, you included, and the only fix is another apply. |
 
 `github_org` and `admin_logins` are read at runtime, not baked into the image.
@@ -189,7 +193,16 @@ Every input is in `variables.tf` with its own description;
 not run Secure Development — the app then falls back to bare repo names. With
 `enable_secure_development = true` its own `validation` block requires it: sync
 exits at startup without one, and the app would have no org to build fork links
-from.
+from. `github_app_id` follows the same rule: sync authenticates to GitHub as an
+App, so a Secure Development event needs its id here and its private key in SSM
+(`GITHUB_APP_PRIVATE_KEY`); `github_app_installation_id` is optional.
+
+The scorer gets a Cloud Map name (`scorer.<name>.internal:4000`) and its own
+security group, which accepts `:4000` from the app (the leaderboard and the
+challenge catalogue) and from sync (`POST /score`) and nothing else. sync stays
+outbound only. `stack.tftest.hcl` reads `docker-compose.yml` and fails if any
+environment key compose gives the app, the scorer or sync is missing from its
+ECS task (#476).
 
 ## Tear down
 
@@ -300,5 +313,8 @@ Do it as a move, not an upgrade:
 6. **`terraform destroy` the old stack** from its own state directory.
 
 Secrets carry over unchanged if you keep the same `ssm_prefix` — except
-`REDIS_PASSWORD` and `SCORER_TOKEN`, which this module does not use, and
-`REDIS_AUTH_TOKEN`, which it creates for you.
+`REDIS_PASSWORD`, which this module does not use, and `REDIS_AUTH_TOKEN`,
+which it creates for you. A Secure Development event also needs
+`SCORER_TOKEN` (the scorer and sync share it) and `GITHUB_APP_PRIVATE_KEY`
+in SSM; create them as in the prerequisites if the old stack did not have
+them. `GITHUB_TOKEN` is no longer read.

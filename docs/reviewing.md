@@ -273,6 +273,14 @@ ADR, not the code.
   regression.
 - **The activity log filters client-side** over its capped row count by
   design — don't request a server-side filter/pagination contract.
+- **Service hops inside the stack are plain HTTP**
+  ([ADR 63](decisions.md#adr-63-service-hops-inside-the-stack-are-plain-http-the-network-is-the-boundary)).
+  The app, sync and the scorer reach `srh`, and the app and sync reach the
+  scorer, over `http://` inside the stack's own network. The `srh` hops and
+  the scorer's `POST /score` carry a bearer token; the scorer's
+  `GET /leaderboard` and `GET /challenges` are open by contract and rely on
+  the network alone. Flag a write or `srh` hop with no token, a rule wider
+  than its caller, or a hop leaving the network, not the plaintext itself.
 - **The event import is not atomic** across reset and content replacement,
   matching the master reset it composes; it is bounded (admin-only,
   refused while live, double-confirmed) and recoverable by re-running.
