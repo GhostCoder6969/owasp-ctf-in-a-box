@@ -119,8 +119,8 @@ variables {
   domain           = "ctf.example.org"
   route53_zone_id  = "Z0123456789ABCDEFGHIJ"
   app_image        = "123456789012.dkr.ecr.us-east-1.amazonaws.com/owasp-ctf-app:v1"
-  scorer_image     = "ghcr.io/example/scorer:v1"
-  sync_image       = "ghcr.io/example/sync:v1"
+  scorer_image     = "123456789012.dkr.ecr.us-east-1.amazonaws.com/owasp-ctf-scorer:mirror-0123456789ab"
+  sync_image       = "123456789012.dkr.ecr.us-east-1.amazonaws.com/owasp-ctf-sync:0123456789ab"
   github_org       = "owasp-ctf-test"
   admin_logins     = "octocat,defunkt"
 }
@@ -598,18 +598,41 @@ run "the_secret_grants_name_resources_never_a_wildcard" {
 run "srh_health_check_issues_a_real_command" {
   command = plan
 
+  // srh's own source: Redix opens the connection lazily, so srh starts green
+  // against an unreachable ElastiCache or a wrong AUTH token. A check that
+  // only proves the process is up would report a healthy stack whose data
+  // path is broken, and the first contestant submission would find out.
+  //
+  // These assertions pin the RENDERED command to srh-healthcheck.sh, and
+  // test/srh-healthcheck.bats executes that file against the pinned srh
+  // image. The two halves need each other: this one alone passed for months
+  // over a `GET /ping` srh answers with a 404 (#476), because a string check
+  // cannot tell a working probe from one that can never succeed.
   assert {
-    // srh's own source: Redix opens the connection lazily, so srh starts green
-    // against an unreachable ElastiCache or a wrong AUTH token. A check that
-    // only proves the process is up would report a healthy stack whose data
-    // path is broken, and the first contestant submission would find out.
-    condition     = strcontains(aws_ecs_task_definition.srh.container_definitions, "Authorization: Bearer")
-    error_message = "srh's health check must issue an authenticated request — an unauthenticated or TCP-only probe passes while Redis is unreachable."
+    condition = jsondecode(aws_ecs_task_definition.srh.container_definitions)[0].healthCheck.command == [
+      "CMD-SHELL",
+      trimspace(file("${path.module}/srh-healthcheck.sh")),
+    ]
+    error_message = "srh's health check must be exactly srh-healthcheck.sh — the file test/srh-healthcheck.bats executes against a real srh. A command written anywhere else is untested."
   }
 
   assert {
-    condition     = strcontains(aws_ecs_task_definition.srh.container_definitions, "grep -q result")
-    error_message = "srh's health check must require a real reply body: srh answers before it has ever contacted Redis."
+    // Non-vacuity for the equality above: an empty file would render an
+    // empty CMD-SHELL and still "equal" itself.
+    condition = alltrue([
+      for needle in [
+        "--post-data='[\"PING\"]'",
+        "grep -q PONG",
+        "Authorization: Bearer $SRH_TOKEN",
+        "Content-Type: application/json",
+      ] : strcontains(jsondecode(aws_ecs_task_definition.srh.container_definitions)[0].healthCheck.command[1], needle)
+    ])
+    error_message = "srh's health check must POST the Upstash body [\"PING\"] as JSON with the bearer token and require PONG back."
+  }
+
+  assert {
+    condition     = !strcontains(jsondecode(aws_ecs_task_definition.srh.container_definitions)[0].healthCheck.command[1], "/ping")
+    error_message = "srh's health check must not call /ping: the pinned srh returns 404 there whatever the token or the Redis state, so srh would never go healthy (#476)."
   }
 }
 
@@ -900,6 +923,358 @@ run "an_empty_installation_id_is_accepted" {
   assert {
     condition     = length(aws_ecs_task_definition.sync) == 1
     error_message = "An empty installation id is legal: sync picks the installation on github_org."
+  }
+}
+
+
+// --- every image has a pullable home, for the CPU the tasks run (#476) -----
+//
+// The scorer package is private by contract and sync is published nowhere, so
+// before #476 a Secure Development stack had no image Fargate could pull for
+// either. registry.tf now gives both a repository here, deploy.sh fills them,
+// and the execution role may pull exactly those.
+
+run "secure_development_creates_scorer_and_sync_repositories" {
+  command = plan
+
+  variables {
+    enable_secure_development = true
+  }
+
+  assert {
+    condition     = toset(keys(aws_ecr_repository.main)) == toset(["app", "scorer", "sync"])
+    error_message = "A Secure Development stack needs ECR repositories for the app, the scorer mirror and sync — Fargate has nowhere else to pull the last two from."
+  }
+
+  assert {
+    // IMMUTABLE for the tag-reuse reason registry.tf gives, and force_delete
+    // so `terraform destroy` really ends the event, for every repository.
+    condition = alltrue([
+      for k, r in aws_ecr_repository.main :
+      r.image_tag_mutability == "IMMUTABLE" && r.force_delete == true && r.name == "${var.name}-${k}"
+    ])
+    error_message = "Every ECR repository must be <name>-<service>, IMMUTABLE, and force_delete so destroy removes it."
+  }
+
+  assert {
+    condition     = output.ecr_scorer_repository_url != "" && output.ecr_sync_repository_url != ""
+    error_message = "deploy.sh learns that the stack runs Secure Development from these outputs being non-empty."
+  }
+}
+
+run "a_quiz_only_event_creates_only_the_app_repository" {
+  command = plan
+
+  variables {
+    enable_secure_development = false
+    scorer_image              = ""
+    sync_image                = ""
+  }
+
+  assert {
+    condition     = toset(keys(aws_ecr_repository.main)) == toset(["app"])
+    error_message = "A quiz-only event runs no scorer and no sync, so it must create no repository for either."
+  }
+
+  assert {
+    // deploy.sh reads "" as "publish the app only".
+    condition     = output.ecr_scorer_repository_url == "" && output.ecr_sync_repository_url == ""
+    error_message = "The scorer and sync repository outputs must be empty when Secure Development is off."
+  }
+
+  assert {
+    condition     = local.execution_pull_policy.Statement[0].Resource == ["arn:aws:ecr:us-east-1:123456789012:repository/owasp-ctf-app"]
+    error_message = "A quiz-only event's execution role may pull the app repository and nothing else."
+  }
+}
+
+run "the_pull_grant_names_the_three_repositories_never_a_wildcard" {
+  command = plan
+
+  variables {
+    enable_secure_development = true
+  }
+
+  assert {
+    // Spelled out, not rebuilt from the same locals the policy uses: a
+    // comparison of a value with itself proves nothing.
+    condition = anytrue([
+      for s in local.execution_pull_policy.Statement :
+      contains(s.Action, "ecr:BatchGetImage") && s.Resource == [
+        "arn:aws:ecr:us-east-1:123456789012:repository/owasp-ctf-app",
+        "arn:aws:ecr:us-east-1:123456789012:repository/owasp-ctf-scorer",
+        "arn:aws:ecr:us-east-1:123456789012:repository/owasp-ctf-sync",
+      ]
+    ])
+    error_message = "The execution role must be able to pull the app, scorer and sync repositories — named, one ARN each."
+  }
+
+  assert {
+    // The one "*" allowed, on the one action AWS offers no resource type for.
+    // Any other statement with a "*" resource is the managed policy's
+    // account-wide grant coming back.
+    condition = alltrue([
+      for s in local.execution_pull_policy.Statement :
+      !contains(s.Resource, "*") || s.Action == ["ecr:GetAuthorizationToken"]
+    ])
+    error_message = "Only ecr:GetAuthorizationToken (which supports no resource-level permission) may use a \"*\" resource in the execution role's pull policy."
+  }
+
+  assert {
+    // A wildcard INSIDE an ARN (repository/*, log-group:*) is the same hole
+    // spelled differently; the log grant's trailing ":*" is the one legal
+    // use, and it follows a named group.
+    condition = alltrue(flatten([
+      for s in local.execution_pull_policy.Statement : [
+        for r in s.Resource :
+        r == "*" || can(regex("^arn:aws:ecr:us-east-1:123456789012:repository/owasp-ctf-(app|scorer|sync)$", r)) || can(regex("^arn:aws:logs:us-east-1:123456789012:log-group:/ecs/owasp-ctf/(app|srh|scorer|sync):\\*$", r))
+      ]
+    ]))
+    error_message = "Every resource in the pull policy must name this event's repository or log group."
+  }
+
+  assert {
+    // Non-vacuity: the alltrue checks above pass over an empty policy.
+    condition     = length(local.execution_pull_policy.Statement) == 3 && length(local.execution_pull_policy.Statement[2].Resource) == 4
+    error_message = "Expected three statements (pull, auth token, logs), the log grant naming all four log groups."
+  }
+
+}
+
+run "a_private_floating_scorer_ref_is_refused" {
+  command = plan
+
+  variables {
+    enable_secure_development = true
+    // What terraform.tfvars.example told operators to set before #476:
+    // private on GHCR, and a floating tag.
+    scorer_image = "ghcr.io/owasp-ctf-test/score:latest"
+  }
+
+  expect_failures = [var.scorer_image]
+}
+
+run "an_ecr_ref_in_another_account_is_refused" {
+  command = plan
+
+  variables {
+    enable_secure_development = true
+    sync_image                = "999999999999.dkr.ecr.us-east-1.amazonaws.com/owasp-ctf-sync:0123456789ab"
+  }
+
+  expect_failures = [var.sync_image]
+}
+
+run "an_ecr_ref_in_another_region_is_refused" {
+  command = plan
+
+  variables {
+    enable_secure_development = true
+    scorer_image              = "123456789012.dkr.ecr.eu-west-1.amazonaws.com/owasp-ctf-scorer:mirror-0123456789ab"
+  }
+
+  expect_failures = [var.scorer_image]
+}
+
+run "a_digest_pinned_image_is_accepted" {
+  command = plan
+
+  variables {
+    enable_secure_development = true
+    scorer_image              = "ghcr.io/example/score@sha256:0000000000000000000000000000000000000000000000000000000000000000"
+    sync_image                = "ghcr.io/example/sync@sha256:1111111111111111111111111111111111111111111111111111111111111111"
+  }
+
+  assert {
+    condition     = jsondecode(aws_ecs_task_definition.scorer[0].container_definitions)[0].image == var.scorer_image
+    error_message = "A digest-pinned scorer image must reach the task definition unchanged."
+  }
+}
+
+// The bootstrap value: legal for `-target=aws_ecr_repository.main`, which
+// plans no task definition, and refused by a precondition on a full plan —
+// a sentence at plan time, where it used to be an apply that timed out on a
+// CannotPullContainerError.
+run "the_placeholder_is_refused_by_a_full_plan" {
+  command = plan
+
+  variables {
+    enable_secure_development = true
+    app_image                 = "PLACEHOLDER-deploy.sh-overwrites-this"
+    scorer_image              = "PLACEHOLDER-deploy.sh-overwrites-this"
+    sync_image                = "PLACEHOLDER-deploy.sh-overwrites-this"
+  }
+
+  expect_failures = [
+    aws_ecs_task_definition.app,
+    aws_ecs_task_definition.scorer,
+    aws_ecs_task_definition.sync,
+  ]
+}
+
+run "every_task_runs_x86_64_to_match_deploy_sh" {
+  command = plan
+
+  variables {
+    enable_secure_development = true
+  }
+
+  assert {
+    // deploy.sh builds and mirrors --platform linux/amd64 (test/aws.bats
+    // asserts that half). An ARM64 task, or an arm64 image on X86_64, is an
+    // exec format error after a clean apply.
+    condition = alltrue([
+      for td in concat(
+        [aws_ecs_task_definition.srh, aws_ecs_task_definition.app],
+        aws_ecs_task_definition.scorer,
+        aws_ecs_task_definition.sync,
+      ) :
+      length(td.runtime_platform) == 1 &&
+      td.runtime_platform[0].cpu_architecture == "X86_64" &&
+      td.runtime_platform[0].operating_system_family == "LINUX"
+    ])
+    error_message = "Every task definition must set runtime_platform X86_64/LINUX — the architecture deploy.sh builds for."
+  }
+
+  assert {
+    // Non-vacuity: the alltrue above passes over an empty list.
+    condition     = length(aws_ecs_task_definition.scorer) == 1 && length(aws_ecs_task_definition.sync) == 1
+    error_message = "Expected four task definitions on a Secure Development event."
+  }
+}
+
+// --- a bad deploy rolls back; srh outlives a failover (#476) --------------
+
+run "every_service_rolls_back_a_deployment_that_never_goes_healthy" {
+  command = plan
+
+  variables {
+    enable_secure_development = true
+  }
+
+  assert {
+    // Without it ECS relaunches failing tasks forever and `terraform apply`
+    // sits on wait_for_steady_state until the provider times out.
+    condition = alltrue([
+      for s in concat(
+        [aws_ecs_service.srh, aws_ecs_service.app],
+        aws_ecs_service.scorer,
+        aws_ecs_service.sync,
+      ) :
+      length(s.deployment_circuit_breaker) == 1 &&
+      s.deployment_circuit_breaker[0].enable == true &&
+      s.deployment_circuit_breaker[0].rollback == true
+    ])
+    error_message = "Every ECS service must enable the deployment circuit breaker with rollback."
+  }
+
+  assert {
+    // Non-vacuity for the alltrue above.
+    condition     = length(aws_ecs_service.scorer) == 1 && length(aws_ecs_service.sync) == 1
+    error_message = "Expected four services on a Secure Development event."
+  }
+}
+
+run "srh_survives_one_task_loss_and_an_elasticache_failover" {
+  command = plan
+
+  assert {
+    // srh is the whole data path; one task is one host retirement from an
+    // outage.
+    condition     = aws_ecs_service.srh.desired_count >= 2
+    error_message = "srh must run at least two tasks: it is the entire data path, and it is stateless behind a MULTIVALUE Cloud Map record."
+  }
+
+  assert {
+    // Both tasks probe the same Redis, so a count alone does not help in a
+    // failover: the probe itself has to outlast one, or ECS replaces every
+    // srh task over an outage a restart cannot fix.
+    condition = (
+      jsondecode(aws_ecs_task_definition.srh.container_definitions)[0].healthCheck.retries *
+      jsondecode(aws_ecs_task_definition.srh.container_definitions)[0].healthCheck.interval
+    ) >= 120
+    error_message = "srh's health check must tolerate at least 120 s of failed probes (retries x interval) so an ElastiCache failover does not get srh killed."
+  }
+
+  assert {
+    // ...and still catch a broken first boot before the provider's 20 minute
+    // steady-state wait gives up.
+    condition = (
+      jsondecode(aws_ecs_task_definition.srh.container_definitions)[0].healthCheck.startPeriod +
+      jsondecode(aws_ecs_task_definition.srh.container_definitions)[0].healthCheck.retries *
+      jsondecode(aws_ecs_task_definition.srh.container_definitions)[0].healthCheck.interval
+    ) <= 300
+    error_message = "srh's health check must still mark a task with a wrong AUTH token or endpoint UNHEALTHY within five minutes."
+  }
+}
+
+run "sync_stays_a_single_poller" {
+  command = plan
+
+  variables {
+    enable_secure_development = true
+  }
+
+  assert {
+    // The circuit breaker added alongside must not have changed this: the
+    // old task goes before the new one arrives.
+    condition = (
+      aws_ecs_service.sync[0].desired_count == 1 &&
+      aws_ecs_service.sync[0].deployment_maximum_percent == 100 &&
+      aws_ecs_service.sync[0].deployment_minimum_healthy_percent == 0
+    )
+    error_message = "sync must stay exactly one task, with min 0 / max 100 so a deployment never runs two pollers."
+  }
+}
+
+// R7 (audit): the runbook and outputs.tf point operators at
+// `aws ecs execute-command`. It needs enable_execute_command on the service
+// and the four ssmmessages actions on the TASK role (the SSM agent runs as the
+// task). On by default for an event; one variable turns it off.
+run "ecs_exec_is_on_by_default_for_every_service" {
+  command = plan
+
+  variables {
+    enable_secure_development = true
+  }
+
+  assert {
+    condition = alltrue([
+      aws_ecs_service.app.enable_execute_command,
+      aws_ecs_service.srh.enable_execute_command,
+      aws_ecs_service.scorer[0].enable_execute_command,
+      aws_ecs_service.sync[0].enable_execute_command,
+    ])
+    error_message = "Every service must allow ECS Exec by default: the runbook's shell depends on it."
+  }
+
+  assert {
+    condition = length(aws_iam_role_policy.task_ecs_exec) == 1 && toset(jsondecode(aws_iam_role_policy.task_ecs_exec[0].policy).Statement[0].Action) == toset([
+      "ssmmessages:CreateControlChannel",
+      "ssmmessages:CreateDataChannel",
+      "ssmmessages:OpenControlChannel",
+      "ssmmessages:OpenDataChannel",
+    ])
+    error_message = "The task role gets exactly the four ssmmessages actions ECS Exec needs, and nothing else."
+  }
+}
+
+run "ecs_exec_off_grants_nothing" {
+  command = plan
+
+  variables {
+    enable_secure_development = true
+    enable_ecs_exec           = false
+  }
+
+  assert {
+    condition     = !aws_ecs_service.app.enable_execute_command && !aws_ecs_service.srh.enable_execute_command
+    error_message = "enable_ecs_exec = false must turn ECS Exec off."
+  }
+
+  assert {
+    condition     = length(aws_iam_role_policy.task_ecs_exec) == 0
+    error_message = "With ECS Exec off, the task role keeps no policy at all."
   }
 }
 

@@ -225,3 +225,225 @@ me"
   # leaves the endpoint half-blind.
   echo "$output" | grep -q 'APP_BUILD_REV=' && echo "$output" | grep -q 'APP_BUILT_AT='
 }
+
+# --- a real (stubbed) run: platform, context, and the sync/scorer images ----
+#
+# #476. The tests above are all --dry-run, which is how the app build's broken
+# context (`apps/web` where apps/web/Dockerfile needs the repo root) shipped:
+# nothing ever looked at a build invocation that would have run. These stubs
+# answer like an applied stack, so deploy.sh takes its real path — and every
+# docker/aws/terraform call is still a recorded no-op. They run against
+# fake_repo, so the image.auto.tfvars they write lands in a throwaway tree.
+
+ACCT_REGISTRY="123456789012.dkr.ecr.us-east-1.amazonaws.com"
+SOURCE_DIGEST="aaaaaaaaaaaabbbbbbbbbbbbccccccccccccddddddddddddeeeeeeeeeeeeffff"
+
+# $1 = 1 for a Secure Development stack, 0 for quiz-only.
+# $2 = "fail-sync-output" to make that one terraform read fail;
+#      "ecr-error" to make every ECR describe-images an access error;
+#      "two-digests" to give the pulled scorer a second (ECR) RepoDigests entry;
+#      "prefixed-mirror" to list, first, a mirror whose name ENDS in the source's;
+#      "port-no-tag" to name the source by a registry port and no tag.
+applied_stack_stubs() {
+  local secdev="$1"
+  local mode="${2:-}"
+  cat > "$STUBS/terraform" <<EOF
+#!/bin/sh
+echo "terraform \$*" >> "$CALLS"
+case "\$*" in
+*ecr_app_repository_url*) printf '%s' "$ACCT_REGISTRY/owasp-ctf-app" ;;
+*ecr_sync_repository_url*)
+  if [ "$mode" = "fail-sync-output" ]; then exit 1; fi
+  if [ "$secdev" = "1" ]; then printf '%s' "$ACCT_REGISTRY/owasp-ctf-sync"; fi ;;
+*ecr_scorer_repository_url*)
+  if [ "$secdev" = "1" ]; then printf '%s' "$ACCT_REGISTRY/owasp-ctf-scorer"; fi ;;
+esac
+exit 0
+EOF
+  # describe-images says the tag is not there yet (ImageNotFoundException, as
+  # the real CLI does), so everything is published — or, in "ecr-error" mode,
+  # it fails for another reason, which must stop the deploy.
+  cat > "$STUBS/aws" <<EOF
+#!/bin/sh
+echo "aws \$*" >> "$CALLS"
+case "\$*" in
+*describe-images*)
+  if [ "$mode" = "ecr-error" ]; then
+    echo "An error occurred (AccessDeniedException) when calling the DescribeImages operation" >&2
+  else
+    echo "An error occurred (ImageNotFoundException) when calling the DescribeImages operation" >&2
+  fi
+  exit 254 ;;
+*get-login-password*) echo stub-password ;;
+esac
+exit 0
+EOF
+  cat > "$STUBS/docker" <<EOF
+#!/bin/sh
+echo "docker \$*" >> "$CALLS"
+case "\$1" in
+login) cat > /dev/null ;;
+image)
+  if [ "$mode" = "prefixed-mirror" ]; then echo "mirror.example/ghcr.io/owasp-ctf-test/score@sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"; fi
+  if [ "$mode" = "port-no-tag" ]; then
+    echo "localhost:5000/owasp-ctf-test/score@sha256:$SOURCE_DIGEST"
+  else
+    echo "ghcr.io/owasp-ctf-test/score@sha256:$SOURCE_DIGEST"
+  fi
+  if [ "$mode" = "two-digests" ]; then echo "$ACCT_REGISTRY/owasp-ctf-scorer@sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"; fi ;;
+esac
+exit 0
+EOF
+  chmod +x "$STUBS/terraform" "$STUBS/aws" "$STUBS/docker"
+}
+
+@test "the app build targets linux/amd64 with no attestation manifests" {
+  run "$SCRIPT" --dry-run
+  [ "$status" -eq 0 ]
+  # Fargate runs X86_64 (stack.tftest.hcl asserts that half); an Apple Silicon
+  # build without --platform is arm64 and dies with an exec format error.
+  echo "$output" | grep 'docker build' | grep 'apps/web/Dockerfile' |
+    grep -F -- '--platform linux/amd64 --provenance=false --sbom=false' | grep -q .
+}
+
+@test "the app is built from the repo root with apps/web/Dockerfile" {
+  repo="$(fake_repo)"
+  applied_stack_stubs 0
+  run "$repo/deploy/aws-terraform/deploy.sh"
+  [ "$status" -eq 0 ]
+  build="$(grep '^docker build' "$CALLS" | grep -F -- "--file $repo/apps/web/Dockerfile")"
+  echo "build call: $build"
+  # The Dockerfile does `COPY apps/web/ ./`, which resolves only from the root:
+  # with apps/web as the context the build died with `"/apps/web": not found`.
+  # The context is the LAST argument, so it must be the repo root itself.
+  [ -n "$build" ] && [ "${build##* }" = "$repo" ]
+}
+
+@test "a Secure Development stack builds sync, mirrors the scorer and pushes both" {
+  repo="$(fake_repo)"
+  applied_stack_stubs 1
+  run "$repo/deploy/aws-terraform/deploy.sh" --scorer-source ghcr.io/owasp-ctf-test/score:latest
+  echo "$output"
+  [ "$status" -eq 0 ]
+  sync_tag="$(grep '^docker build' "$CALLS" | grep -F -- "--file $repo/sync/Dockerfile" |
+    grep -F -- '--platform linux/amd64 --provenance=false --sbom=false' |
+    sed -n "s|.*--tag $ACCT_REGISTRY/owasp-ctf-sync:\([^ ]*\) .*|\1|p")"
+  scorer_ref="$ACCT_REGISTRY/owasp-ctf-scorer:mirror-${SOURCE_DIGEST:0:12}"
+  echo "sync tag: '$sync_tag'"
+  cat "$CALLS"
+  [ -n "$sync_tag" ] &&
+    grep -qx "docker pull --platform linux/amd64 ghcr.io/owasp-ctf-test/score:latest" "$CALLS" &&
+    grep -qx "docker tag ghcr.io/owasp-ctf-test/score:latest $scorer_ref" "$CALLS" &&
+    grep -qx "docker push $ACCT_REGISTRY/owasp-ctf-sync:$sync_tag" "$CALLS" &&
+    grep -qx "docker push $scorer_ref" "$CALLS"
+}
+
+@test "a Secure Development deploy writes all three refs into image.auto.tfvars" {
+  repo="$(fake_repo)"
+  applied_stack_stubs 1
+  run "$repo/deploy/aws-terraform/deploy.sh" --scorer-source ghcr.io/owasp-ctf-test/score:latest
+  [ "$status" -eq 0 ]
+  vars="$repo/deploy/aws-terraform/image.auto.tfvars"
+  cat "$vars"
+  grep -q "^app_image = \"$ACCT_REGISTRY/owasp-ctf-app:[^\"]*\"$" "$vars" &&
+    grep -q "^sync_image = \"$ACCT_REGISTRY/owasp-ctf-sync:[^\"]*\"$" "$vars" &&
+    grep -qx "scorer_image = \"$ACCT_REGISTRY/owasp-ctf-scorer:mirror-${SOURCE_DIGEST:0:12}\"" "$vars"
+}
+
+@test "SCORE_IMAGE from the event .env is the default scorer source" {
+  repo="$(fake_repo)"
+  applied_stack_stubs 1
+  SCORE_IMAGE=ghcr.io/owasp-ctf-test/score:v9 run "$repo/deploy/aws-terraform/deploy.sh"
+  [ "$status" -eq 0 ]
+  grep -qx "docker pull --platform linux/amd64 ghcr.io/owasp-ctf-test/score:v9" "$CALLS"
+}
+
+@test "a Secure Development stack with no scorer source is refused before any build" {
+  repo="$(fake_repo)"
+  applied_stack_stubs 1
+  SCORE_IMAGE="" run "$repo/deploy/aws-terraform/deploy.sh"
+  echo "$output"
+  [ "$status" -ne 0 ]
+  [ -z "$(grep '^docker build' "$CALLS")" ]
+  echo "$output" | grep -q -- '--scorer-source'
+}
+
+@test "a quiz-only stack publishes the app alone and writes only app_image" {
+  repo="$(fake_repo)"
+  applied_stack_stubs 0
+  SCORE_IMAGE="" run "$repo/deploy/aws-terraform/deploy.sh"
+  [ "$status" -eq 0 ]
+  vars="$repo/deploy/aws-terraform/image.auto.tfvars"
+  cat "$vars"
+  [ -z "$(grep -E '^docker (pull|tag)' "$CALLS")" ]
+  [ -z "$(grep -E '^(sync|scorer)_image' "$vars")" ]
+  grep -q '^app_image = ' "$vars"
+}
+
+@test "a failed read of the sync repository output is refused, not taken as quiz-only" {
+  # Fail-closed: read as "Secure Development is off", this would write an
+  # image.auto.tfvars with no scorer or sync image.
+  repo="$(fake_repo)"
+  applied_stack_stubs 1 fail-sync-output
+  run "$repo/deploy/aws-terraform/deploy.sh" --scorer-source ghcr.io/owasp-ctf-test/score:latest
+  [ "$status" -ne 0 ]
+  [ ! -f "$repo/deploy/aws-terraform/image.auto.tfvars" ]
+  echo "$output" | grep -q 'ecr_sync_repository_url'
+}
+
+@test "--dry-run with a scorer source still makes no docker, aws or terraform call" {
+  run "$SCRIPT" --dry-run --scorer-source ghcr.io/owasp-ctf-test/score:latest
+  [ "$status" -eq 0 ]
+  echo "$output" | grep -q 'docker pull --platform linux/amd64 ghcr.io/owasp-ctf-test/score:latest'
+  [ ! -s "$CALLS" ]
+}
+
+# Review (#507): after the first push the local image also carries an ECR
+# RepoDigests entry, and a --platform pull+push makes a single-platform
+# manifest whose digest differs from the source's. Taking entry 0 could then
+# pick the ECR one, change the mirror tag and push a duplicate.
+@test "the scorer mirror tag comes from the source repository's digest, not another RepoDigests entry" {
+  repo="$(fake_repo)"
+  applied_stack_stubs 1 two-digests
+  run "$repo/deploy/aws-terraform/deploy.sh" --scorer-source ghcr.io/owasp-ctf-test/score:latest
+  echo "$output"
+  [ "$status" -eq 0 ]
+  grep -qx "docker push $ACCT_REGISTRY/owasp-ctf-scorer:mirror-${SOURCE_DIGEST:0:12}" "$CALLS"
+}
+
+# Review (#507): the entry has to START with the source repository. A
+# substring match also takes a mirror whose name merely ends in it, listed
+# ahead of the source's own entry.
+@test "the scorer mirror tag ignores a RepoDigests entry that only ends in the source repository" {
+  repo="$(fake_repo)"
+  applied_stack_stubs 1 prefixed-mirror
+  run "$repo/deploy/aws-terraform/deploy.sh" --scorer-source ghcr.io/owasp-ctf-test/score:latest
+  echo "$output"
+  [ "$status" -eq 0 ]
+  grep -qx "docker push $ACCT_REGISTRY/owasp-ctf-scorer:mirror-${SOURCE_DIGEST:0:12}" "$CALLS"
+}
+
+# Review (#507): with no tag, the last colon is the registry port's, and
+# stripping it left "localhost" — so no entry matched and the deploy failed.
+@test "a scorer source with a registry port and no tag still finds its digest" {
+  repo="$(fake_repo)"
+  applied_stack_stubs 1 port-no-tag
+  run "$repo/deploy/aws-terraform/deploy.sh" --scorer-source localhost:5000/owasp-ctf-test/score
+  echo "$output"
+  [ "$status" -eq 0 ]
+  grep -qx "docker push $ACCT_REGISTRY/owasp-ctf-scorer:mirror-${SOURCE_DIGEST:0:12}" "$CALLS"
+}
+
+# Review (#507): describe-images fails both for "no such tag" and for an
+# access or API error. Only the first means "publish it"; the second must stop
+# before anything is built or pushed.
+@test "an ECR read error stops the deploy before any build or push" {
+  repo="$(fake_repo)"
+  applied_stack_stubs 1 ecr-error
+  run "$repo/deploy/aws-terraform/deploy.sh" --scorer-source ghcr.io/owasp-ctf-test/score:latest
+  echo "$output"
+  [ "$status" -ne 0 ]
+  echo "$output" | grep -q "could not read ECR"
+  [ -z "$(grep -E '^docker (build|push)' "$CALLS")" ]
+}
+

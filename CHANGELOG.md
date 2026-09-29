@@ -317,6 +317,61 @@ repo-level — `apps/web/package.json` tracks the current tag; `scorer` and
     `GITHUB_APP_PRIVATE_KEY` (base64 of the `.pem`) and `SCORER_TOKEN`
     instead. `docs/aws.md` and the module README list the commands.
 
+- **The AWS stack comes up (#476, pre-event bring-up fixes).** The stack
+  had never been applied, and a rehearsal would have stopped at the first
+  image build.
+  - **ECS Exec is on by default** (`enable_ecs_exec`), so `aws ecs
+    execute-command` gives an operator a shell in a running task on event day.
+  - **srh's health check could never pass.** It called `GET /ping`, which
+    the pinned srh answers with a 404, so srh never went healthy and the first
+    apply hung. It now POSTs `["PING"]` as JSON and requires `PONG`. The
+    command lives in `srh-healthcheck.sh`, which `terraform.yml` runs inside
+    the pinned srh image against a real Redis.
+  - **The app image could not be built.** `deploy.sh` used `apps/web` as the
+    build context, but the Dockerfile needs the repo root. It now builds the
+    way compose and the Fly deploy do.
+  - **Everything is built for `linux/amd64`**, and every task definition says
+    X86_64. An Apple Silicon laptop used to push arm64 images.
+  - **The scorer and sync now live in the stack's own ECR.** Fargate could
+    pull neither: the scorer package is private and sync is published nowhere.
+    `deploy.sh` builds sync, mirrors the scorer from `--scorer-source`
+    (default `$SCORE_IMAGE`) and writes all three image refs. The execution
+    role pulls those three repositories by name, in place of the managed
+    policy's `"*"`.
+  - Every service rolls back a deployment that never goes healthy. srh runs
+    two tasks, with a health check that rides out an ElastiCache failover.
+  - `backend.tf.example` and the README's Remote state section set up the S3
+    state a real event needs. The bootstrap docs, the tfvars example and the
+    `next_steps` output now agree.
+  - **Breaking for an existing `terraform.tfvars`:** a
+    `ghcr.io/<org>/score:latest` `scorer_image`, or a hand-pushed
+    `sync_image`, is refused at plan time. Replace both with the placeholder
+    from `terraform.tfvars.example`, re-run the bootstrap apply to create the
+    two new repositories, then run `./deploy.sh --scorer-source
+    <SCORE_IMAGE>`, which writes both. `docker login` to the scorer's registry
+    first.
+  - **On a stack that is already running an event:** do not take this
+    upgrade mid-event. The first apply after it replaces the scorer and sync
+    task definitions (new image refs) and the execution role's policy, and
+    brings a second srh task up, so every service rolls once. Take it before
+    the event or after it, never during one; `/admin` → Freeze first if you
+    must.
+
+- **Docs: an AWS event-day runbook, and the gaps an organizer should know
+  about.** `docs/aws.md` now covers running the event on ECS: watching the
+  services, a shell with ECS Exec, freezing scoring, what an app task loss,
+  an srh restart, an ElastiCache failover and a sync restart each look like,
+  rolling back a bad image, running the load pass by hand (the load-test
+  harness is Fly-only), and a tear-down that exports first and deletes the
+  hand-made SSM parameters. `docs/troubleshooting.md` gains the matching ECS
+  recipes. `docs/operations.md` and the `/admin` help text now say that the
+  quiz attempt cap, the quiz retry cooldown and the classic cooldown count
+  per contestant while points count per team, so a team of N gets N times
+  the budget. The pre-event checks now dispatch `stock-scores-zero` and
+  `patched-scores-right` on the release commit. The `ctf-setup.sh` header
+  now describes `launch` in the order it runs: wait for Launch, then make
+  the forks public.
+
 ## v0.6.0 — 2026-09-20
 
 ### Breaking changes

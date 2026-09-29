@@ -77,6 +77,15 @@ resource "aws_cloudwatch_log_group" "main" {
 }
 
 locals {
+  // Every task runs X86_64, SAID rather than left to Fargate's default, because
+  // it is one half of a contract: deploy.sh builds and mirrors every image
+  // `--platform linux/amd64`, and the two must agree or a task dies with an
+  // exec format error after a clean apply. An operator's Apple Silicon laptop
+  // builds arm64 unless told otherwise, which is how that nearly shipped
+  // (#476). stack.tftest.hcl asserts all four task definitions carry it;
+  // changing to ARM64 (Graviton) means changing deploy.sh's --platform too.
+  task_cpu_architecture = "X86_64"
+
   event_url = "https://${var.domain}"
   srh_host  = "srh.${aws_service_discovery_private_dns_namespace.main.name}"
 
@@ -144,6 +153,11 @@ resource "aws_ecs_task_definition" "srh" {
   execution_role_arn       = aws_iam_role.execution.arn
   task_role_arn            = aws_iam_role.task.arn
 
+  runtime_platform {
+    operating_system_family = "LINUX"
+    cpu_architecture        = local.task_cpu_architecture
+  }
+
   container_definitions = jsonencode([{
     name      = "srh"
     image     = var.srh_image
@@ -176,16 +190,35 @@ resource "aws_ecs_task_definition" "srh" {
     // contestant submission would be what discovered it.
     //
     // This issues a REAL command through the REST interface with the bearer
-    // token and requires a result back. It fails when Redis is unreachable,
-    // when AUTH is wrong, and when TLS does not verify.
+    // token — the Upstash command body `["PING"]`, POSTed as JSON to `/` —
+    // and requires PONG back. It fails when Redis is unreachable, when AUTH
+    // is wrong, and when TLS does not verify.
+    //
+    // The first version asked `GET /ping` and grepped for `result`. The pinned
+    // srh answers that path with a 404 whatever the token or the Redis state,
+    // so the check could never pass: srh would never have gone healthy, and
+    // with `wait_for_steady_state` the first apply would have hung until the
+    // provider timed out (#476). A `strcontains` test passed over it. The
+    // `Content-Type` header is not decoration either — srh answers 400
+    // without it.
+    //
+    // The command lives in srh-healthcheck.sh, ONE line and nothing else, so
+    // there is a single source: this reads it verbatim, and
+    // test/srh-healthcheck.bats runs that same file inside the pinned srh
+    // image against a real Redis (right token passes; wrong token and a
+    // stopped Redis fail). terraform.yml makes that test mandatory in CI.
+    // `file()` does not interpolate, so `$SRH_TOKEN` reaches the container
+    // shell unexpanded, which is where it must be expanded.
     healthCheck = {
       command = [
         "CMD-SHELL",
-        "wget -q -O - --header=\"Authorization: Bearer $SRH_TOKEN\" http://127.0.0.1:80/ping | grep -q result || exit 1",
+        trimspace(file("${path.module}/srh-healthcheck.sh")),
       ]
+      // 8 x 15 s: long enough to ride out an ElastiCache failover without
+      // ECS killing srh over it — aws_ecs_service.srh says why.
       interval    = 15
       timeout     = 5
-      retries     = 3
+      retries     = 8
       startPeriod = 20
     }
 
@@ -197,8 +230,40 @@ resource "aws_ecs_service" "srh" {
   name            = "srh"
   cluster         = aws_ecs_cluster.main.id
   task_definition = aws_ecs_task_definition.srh.arn
-  desired_count   = 1
-  launch_type     = "FARGATE"
+  // TWO tasks, and a health check that outlasts a failover (#476).
+  //
+  // srh is the entire data path — every page, submit and Lua script goes
+  // through it — so one task is one host retirement or one failed
+  // replacement from the event being down. It is stateless and Cloud Map's
+  // record is MULTIVALUE, so a second task is a second A record and nothing
+  // else.
+  //
+  // Two tasks alone would NOT survive an ElastiCache failover, though: both
+  // probe the same Redis, so both would go unhealthy together and ECS would
+  // replace both — a restart that cannot fix Redis, with a Fargate cold start
+  // (ENI plus image pull) added on top of the failover. So the task
+  // definition's health check tolerates `retries * interval` = 8 * 15 s =
+  // 120 s of a failing probe before ECS acts, comfortably past a Multi-AZ
+  // failover (typically well under a minute). The probe still catches what it
+  // exists for: a wrong AUTH token or endpoint at first boot fails every
+  // attempt, so the task goes UNHEALTHY about two and a half minutes in, and
+  // the circuit breaker below rolls the deployment back. Size it again from
+  // the rehearsal's failover drill if that measures longer.
+  desired_count = 2
+  launch_type   = "FARGATE"
+
+  // A deployment whose tasks never go healthy (bad image, missing secret,
+  // wrong architecture) is rolled back to the last working one instead of
+  // being relaunched forever while `terraform apply` sits on
+  // wait_for_steady_state until the provider times out (#476). Every service
+  // carries this.
+  // R7: the runbook's shell (`aws ecs execute-command`). See var.enable_ecs_exec.
+  enable_execute_command = var.enable_ecs_exec
+
+  deployment_circuit_breaker {
+    enable   = true
+    rollback = true
+  }
 
   network_configuration {
     subnets          = aws_subnet.public[*].id
@@ -228,6 +293,18 @@ resource "aws_ecs_task_definition" "app" {
   memory                   = var.app_memory
   execution_role_arn       = aws_iam_role.execution.arn
   task_role_arn            = aws_iam_role.task.arn
+
+  runtime_platform {
+    operating_system_family = "LINUX"
+    cpu_architecture        = local.task_cpu_architecture
+  }
+
+  lifecycle {
+    precondition {
+      condition     = var.app_image != local.image_placeholder
+      error_message = "app_image is still the terraform.tfvars.example placeholder. Run ./deploy.sh after the bootstrap apply (docs/aws.md): it pushes the image and writes the real ref into image.auto.tfvars."
+    }
+  }
 
   container_definitions = jsonencode([{
     name      = "app"
@@ -279,6 +356,15 @@ resource "aws_ecs_service" "app" {
   desired_count   = var.app_desired_count
   launch_type     = "FARGATE"
 
+  // aws_ecs_service.srh says why every service carries this.
+  // R7: the runbook's shell (`aws ecs execute-command`). See var.enable_ecs_exec.
+  enable_execute_command = var.enable_ecs_exec
+
+  deployment_circuit_breaker {
+    enable   = true
+    rollback = true
+  }
+
   network_configuration {
     subnets          = aws_subnet.public[*].id
     security_groups  = [aws_security_group.app.id]
@@ -316,6 +402,18 @@ resource "aws_ecs_task_definition" "scorer" {
   execution_role_arn       = aws_iam_role.execution.arn
   task_role_arn            = aws_iam_role.task.arn
 
+  runtime_platform {
+    operating_system_family = "LINUX"
+    cpu_architecture        = local.task_cpu_architecture
+  }
+
+  lifecycle {
+    precondition {
+      condition     = var.scorer_image != local.image_placeholder
+      error_message = "scorer_image is still the terraform.tfvars.example placeholder. Run ./deploy.sh after the bootstrap apply (docs/aws.md): it pushes the image and writes the real ref into image.auto.tfvars."
+    }
+  }
+
   container_definitions = jsonencode([{
     name      = "scorer"
     image     = var.scorer_image
@@ -340,6 +438,15 @@ resource "aws_ecs_service" "scorer" {
   task_definition = aws_ecs_task_definition.scorer[0].arn
   desired_count   = 1
   launch_type     = "FARGATE"
+
+  // aws_ecs_service.srh says why every service carries this.
+  // R7: the runbook's shell (`aws ecs execute-command`). See var.enable_ecs_exec.
+  enable_execute_command = var.enable_ecs_exec
+
+  deployment_circuit_breaker {
+    enable   = true
+    rollback = true
+  }
 
   network_configuration {
     subnets          = aws_subnet.public[*].id
@@ -366,6 +473,18 @@ resource "aws_ecs_task_definition" "sync" {
   memory                   = 512
   execution_role_arn       = aws_iam_role.execution.arn
   task_role_arn            = aws_iam_role.task.arn
+
+  runtime_platform {
+    operating_system_family = "LINUX"
+    cpu_architecture        = local.task_cpu_architecture
+  }
+
+  lifecycle {
+    precondition {
+      condition     = var.sync_image != local.image_placeholder
+      error_message = "sync_image is still the terraform.tfvars.example placeholder. Run ./deploy.sh after the bootstrap apply (docs/aws.md): it pushes the image and writes the real ref into image.auto.tfvars."
+    }
+  }
 
   container_definitions = jsonencode([{
     name      = "sync"
@@ -401,14 +520,26 @@ resource "aws_ecs_service" "sync" {
   desired_count   = 1
   launch_type     = "FARGATE"
 
+  // aws_ecs_service.srh says why every service carries this. A rollback here
+  // still respects the single-poller rule below: min 0 / max 100 governs the
+  // rollback deployment too.
+  // R7: the runbook's shell (`aws ecs execute-command`). See var.enable_ecs_exec.
+  enable_execute_command = var.enable_ecs_exec
+
+  deployment_circuit_breaker {
+    enable   = true
+    rollback = true
+  }
+
   network_configuration {
     subnets          = aws_subnet.public[*].id
     security_groups  = [aws_security_group.worker.id]
     assign_public_ip = true
   }
 
-  // Exactly one poller, never two: a second would double-ingest every score
-  // comment. The old task goes before the new one arrives.
+  // Exactly one poller, never two. A second would not double-count (the
+  // scorer's HSETNX dedupes), but it doubles GitHub API use and the
+  // ingested/dropped counters. The old task goes before the new one arrives.
   deployment_minimum_healthy_percent = 0
   deployment_maximum_percent         = 100
 
