@@ -25,10 +25,10 @@
     "@types/node": "^26",
     "@types/react": "^19",
     "@types/react-dom": "^19",
-    "@types/react-test-renderer": "^19.3.0",
+    "@types/react-test-renderer": "19.3.0",
     "eslint": "^9",
     "eslint-config-next": "16.3.6",
-    "react-test-renderer": "^19.3.0",
+    "react-test-renderer": "19.3.0",
     "tailwindcss": "^4",
     "typescript": "^6",
     "vitest": "4.1.11"
