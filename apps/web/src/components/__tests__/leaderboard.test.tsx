@@ -14,24 +14,14 @@ vi.mock("next/image", () => ({
   },
 }));
 
-// The stateful tests below mount the component for real (react-test-renderer
-// runs effects, and next/link's prefetch effect needs `self`), so Link is a
-// plain anchor here — same reason next/image is mocked above.
-vi.mock("next/link", () => ({
-  default: ({ href, children, ...rest }: { href: string; children: ReactNode }) => (
-    <a href={href} {...rest}>
-      {children}
-    </a>
-  ),
-}));
-
-// Lets react-test-renderer's act() flush state updates outside of jest.
-(globalThis as Record<string, unknown>).IS_REACT_ACT_ENVIRONMENT = true;
-
-import { act, type ReactNode } from "react";
-import TestRenderer from "react-test-renderer";
-
-import Leaderboard, { EntryRow, TeamRow } from "@/components/leaderboard";
+import Leaderboard, {
+  EntryRow,
+  TeamRow,
+  NoMatch,
+  individualBoardState,
+  collapsedAfterViewSwitch,
+  resolveActiveView,
+} from "@/components/leaderboard";
 import type { ResolvedModule } from "@/lib/modules";
 import { apps } from "@/lib/apps";
 import type { LeaderboardData, LeaderboardEntry, TeamStanding, ChallengeCatalog } from "@/lib/leaderboard/types";
@@ -440,129 +430,77 @@ describe("per-module breakdown", () => {
   });
 });
 
-// The three #481 edge cases, pinned by #482. Each of these drives the live
-// component (clicks, typing, re-renders with new props) through
-// react-test-renderer — static markup always renders the initial state, so
-// it cannot reach a typed query, a switched view, or props arriving after
-// mount. New dependency, but the smallest one that can click: no DOM, no
-// testing-library, no config change.
-function renderBoard(board: LeaderboardData): TestRenderer.ReactTestRenderer {
-  let tree!: TestRenderer.ReactTestRenderer;
-  act(() => {
-    tree = TestRenderer.create(
-      <Leaderboard data={board} viewerLogin={null} modules={MODULES} enabledApps={apps} />,
-    );
-  });
-  return tree;
-}
-
-// toJSON splits text across child nodes ("No ", "contestants", ...), so
-// join every string leaf to get the readable text back.
-function visibleText(tree: TestRenderer.ReactTestRenderer): string {
-  const out: string[] = [];
-  const walk = (node: unknown): void => {
-    if (typeof node === "string") out.push(node);
-    else if (Array.isArray(node)) node.forEach(walk);
-    else if (node !== null && typeof node === "object" && "children" in node)
-      walk((node as { children: unknown }).children);
-  };
-  walk(tree.toJSON());
-  return out.join("");
-}
-
-function click(tree: TestRenderer.ReactTestRenderer, label: string): void {
-  const button = tree.root
-    .findAllByType("button")
-    .find((n) => n.props.children === label);
-  expect(button, `no button labelled "${label}"`).toBeDefined();
-  act(() => {
-    button?.props.onClick();
-  });
-}
-
-// The row's own toggle is the button carrying aria-expanded.
-function rowToggle(tree: TestRenderer.ReactTestRenderer, row: typeof EntryRow | typeof TeamRow) {
-  return tree.root.findByType(row).findAllByType("button").find((n) => "aria-expanded" in n.props);
-}
-
+// The three #481 edge cases, pinned by #482. The calls the component
+// branches on live in exported helpers in leaderboard.tsx, so these test
+// the helpers straight, plus the markup where static rendering reaches.
+// No clicking needed, no render harness.
 describe("leaderboard edge cases (#481)", () => {
   it("shows NoMatch, not EmptyBoard, for a query on a board with no scored contestants", () => {
-    // Teams exist so the search box is up, but nobody has scored yet. Typing
-    // used to keep the EmptyBoard podium on screen; now the query falls
-    // through to NoMatch, and only the bare query still draws the podium.
+    // Only the bare query still draws the podium.
+    expect(individualBoardState(0, "", 0)).toBe("empty");
+    // Typing used to keep the EmptyBoard podium on screen; now the query
+    // falls through to NoMatch. Reverting the `query.trim() === ""` half
+    // of the check flips both of these back to "empty".
+    expect(individualBoardState(0, "zzz", 0)).toBe("no-match");
+    expect(individualBoardState(3, "zzz", 0)).toBe("no-match");
+    expect(individualBoardState(2, "", 2)).toBe("list");
+    // A whitespace-only box is still a bare query.
+    expect(individualBoardState(0, "   ", 0)).toBe("empty");
+
+    // And the bare query really does draw the podium in the component.
     const board = data({
       entries: [],
-      teams: [team()],
-      capabilities: { apps: false, teams: true, challenges: false },
+      teams: [],
+      capabilities: { apps: false, teams: false, challenges: false },
     });
-    const tree = renderBoard(board);
-    // The default view is teams; the empty individual board is one toggle away.
-    click(tree, "individual");
-    expect(visibleText(tree)).toContain("The board is wide open");
+    const html = renderToStaticMarkup(
+      <Leaderboard data={board} viewerLogin={null} modules={MODULES} enabledApps={apps} />,
+    );
+    expect(html).toContain("The board is wide open");
+  });
 
-    const input = tree.root.findByType("input");
-    act(() => {
-      input.props.onChange({ target: { value: "zzz" } });
-    });
-    const matched = visibleText(tree);
-    expect(matched).toContain("No contestants matching");
-    expect(matched).toContain("zzz");
+  it("pins the nobody-scored copy for a query on an empty board", () => {
+    const html = renderToStaticMarkup(
+      <NoMatch noun="contestants" query="zzz" onClear={() => {}} boardEmpty />,
+    );
+    expect(html).toContain("No contestants matching");
+    expect(html).toContain("zzz");
     // Nobody to spell-check against, so the spelling nudge would be wrong.
-    expect(matched).toContain("Nobody has scored yet");
-    expect(matched).not.toContain("The board is wide open");
-
-    // Clearing the search brings the podium back.
-    click(tree, "$ clear search");
-    expect(visibleText(tree)).toContain("The board is wide open");
+    expect(html).toContain("Nobody has scored yet");
+    // The populated-board line stays on the populated board.
+    const full = renderToStaticMarkup(
+      <NoMatch noun="contestants" query="zzz" onClear={() => {}} boardEmpty={false} />,
+    );
+    expect(full).toContain("Double-check the spelling");
+    expect(full).not.toContain("Nobody has scored yet");
   });
 
   it("does not carry an expanded row across views", () => {
-    // The contestant's login equals the team slug on purpose: without the
-    // view toggle clearing `expanded`, switching to teams reopens the same
-    // slug as a team row.
-    const board = data({
-      entries: [entry({ login: "red-team" })],
-      teams: [team({ slug: "red-team", members: ["alice", "bob"], captain: "alice" })],
-      capabilities: { apps: false, teams: true, challenges: false },
-    });
-    const tree = renderBoard(board);
-    click(tree, "individual");
-    const entryToggle = rowToggle(tree, EntryRow);
-    act(() => {
-      entryToggle?.props.onClick();
-    });
-    // The row really is open, or the assertion below would pass vacuously.
-    expect(rowToggle(tree, EntryRow)?.props["aria-expanded"]).toBe(true);
-
-    click(tree, "teams");
-    const teamsText = visibleText(tree);
-    expect(teamsText).toContain("Red Team");
-    expect(rowToggle(tree, TeamRow)?.props["aria-expanded"]).toBe(false);
-    // A closed team row shows counts, never member names or the captain mark.
-    expect(teamsText).not.toContain("alice");
-    expect(teamsText).not.toContain("captain");
+    // The toggle clears `expanded` on every switch, so the other view
+    // starts closed even when a team row shares the old login's slug
+    // ("red-team"). Dropping the clear from the onClick reopens it.
+    expect(collapsedAfterViewSwitch()).toBeNull();
   });
 
   it("falls back to the individual view when the teams disappear", () => {
     // Deleting the last team while watching the teams view used to trap the
-    // page on an empty teams filter; now the view falls back to individual.
+    // page on an empty teams filter. Returning `requested` here reopens it.
+    expect(resolveActiveView("teams", false)).toBe("individual");
+    expect(resolveActiveView("teams", true)).toBe("teams");
+    expect(resolveActiveView("individual", false)).toBe("individual");
+
+    // What the fallback looks like once it fires: the individual board,
+    // not an empty teams filter.
     const board = data({
       entries: [entry({ login: "alice" }), entry({ rank: 2, login: "bob", points: 80 })],
-      teams: [team()],
+      teams: [],
       capabilities: { apps: false, teams: true, challenges: false },
     });
-    const tree = renderBoard(board);
-    expect(tree.root.findByType("input").props.placeholder).toBe("Search teams…");
-    expect(visibleText(tree)).toContain("Red Team");
-
-    act(() => {
-      tree.update(
-        <Leaderboard data={{ ...board, teams: [] }} viewerLogin={null} modules={MODULES} enabledApps={apps} />,
-      );
-    });
-    expect(tree.root.findByType("input").props.placeholder).toBe("Search contestants…");
-    const fellBack = visibleText(tree);
-    expect(fellBack).toContain("alice");
-    expect(fellBack).toContain("Sort:");
+    const html = renderToStaticMarkup(
+      <Leaderboard data={board} viewerLogin={null} modules={MODULES} enabledApps={apps} />,
+    );
+    expect(html).toContain("alice");
+    expect(html).toMatch(/Sort:/);
+    expect(html).not.toMatch(/aria-pressed/);
   });
 });

@@ -413,6 +413,7 @@ repo-level — `apps/web/package.json` tracks the current tag; `scorer` and
   `patched-scores-right` on the release commit. The `ctf-setup.sh` header
   now describes `launch` in the order it runs: wait for Launch, then make
   the forks public.
+- **The empty board says nobody has scored yet (#482).** A typed query on a board with no scored contestants used to get the spelling nudge, which is wrong when there is no board to check against. It now says nobody has scored yet instead, and only the bare query still draws the "board is wide open" podium. Ships with regression tests for the #481 edge cases.
 
 ## v0.6.0 — 2026-09-20
 

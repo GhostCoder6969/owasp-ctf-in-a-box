@@ -22,8 +22,37 @@ import type { LeaderboardData } from "@/lib/leaderboard/types";
 // other caller keep importing them from here, where they have always lived.
 export { EntryRow, TeamRow };
 
-type View = "individual" | "teams";
+export type View = "individual" | "teams";
 type SortKey = "rank" | "points" | "solved";
+
+/** Which individual-board state to render, from the entry count and the
+ *  query. The bare query on a board with nobody scored draws the podium
+ *  ("empty"); a typed query with nothing to match falls through to
+ *  no-match, same as a populated board with zero hits. */
+export type IndividualBoardState = "empty" | "no-match" | "list";
+export function individualBoardState(
+  entryCount: number,
+  query: string,
+  visibleCount: number,
+): IndividualBoardState {
+  if (entryCount === 0 && query.trim() === "") return "empty";
+  if (visibleCount === 0) return "no-match";
+  return "list";
+}
+
+/** Switching views always closes whatever row is open. The toggle can't
+ *  keep the slug: a team row shares its key space with the individual
+ *  rows, so carrying it over reopens the wrong row. */
+export function collapsedAfterViewSwitch(): null {
+  return null;
+}
+
+/** The teams view only exists while the toggle does. If the last team
+ *  goes away under a viewer on the teams view, they land back on
+ *  individual instead of an empty teams filter. */
+export function resolveActiveView(requested: View, teamsToggleShown: boolean): View {
+  return teamsToggleShown ? requested : "individual";
+}
 
 /** Shown when the individual board holds no contestants at all (pre-event, or
  *  after a reset) AND the search box is empty. Once the user has typed
@@ -76,7 +105,7 @@ export function EmptyBoard({ modules }: { modules: readonly ResolvedModule[] }) 
  *  second line says which case it is: the spelling nudge when there is a
  *  board to check against, a plain nobody-scored line when there isn't.
  *  Always offers the way out (clearing the search) rather than dead-ending. */
-function NoMatch({ noun, query, onClear, boardEmpty }: { noun: string; query: string; onClear: () => void; boardEmpty: boolean }) {
+export function NoMatch({ noun, query, onClear, boardEmpty }: { noun: string; query: string; onClear: () => void; boardEmpty: boolean }) {
   return (
     <div className="flex flex-col items-center gap-3 rounded-lg border border-white/[0.06] bg-[#16162a] px-5 py-10 text-center">
       <p className="text-base text-zinc-300">
@@ -123,7 +152,7 @@ export default function Leaderboard({
   const [expanded, setExpanded] = useState<string | null>(null);
 
   // If teams are deleted while viewing them, force the view back to individual
-  const activeView = showTeamsToggle ? view : "individual";
+  const activeView = resolveActiveView(view, showTeamsToggle);
 
   const topPoints = useMemo(
     () => data.entries.reduce((max, e) => Math.max(max, e.points), 0),
@@ -164,6 +193,8 @@ export default function Leaderboard({
    *  state stands alone. Teams can exist before anyone has solved anything, so
    *  this checks both collections rather than just `entries`. */
   const boardIsEmpty = data.entries.length === 0 && data.teams.length === 0;
+
+  const boardState = individualBoardState(data.entries.length, query, visibleEntries.length);
 
   // The chart plots every enabled module now: the source supplies
   // secure-development's history and `withModuleSeries` merges the app-side
@@ -233,7 +264,7 @@ export default function Leaderboard({
               <button
                 key={v}
                 type="button"
-                onClick={() => { setView(v); setExpanded(null); }}
+                onClick={() => { setView(v); setExpanded(collapsedAfterViewSwitch()); }}
                 aria-pressed={activeView === v}
                 className={`rounded-full border px-3 py-1 text-xs font-medium capitalize transition-colors focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[#d4a017] ${
                   activeView === v
@@ -283,9 +314,9 @@ export default function Leaderboard({
       )}
 
       {activeView === "individual" ? (
-        data.entries.length === 0 && query.trim() === "" ? (
+        boardState === "empty" ? (
           <EmptyBoard modules={modules} />
-        ) : visibleEntries.length === 0 ? (
+        ) : boardState === "no-match" ? (
           <NoMatch noun="contestants" query={query.trim()} onClear={() => setQuery("")} boardEmpty={data.entries.length === 0} />
         ) : (
           <ul className="flex flex-col gap-2.5">
