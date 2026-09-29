@@ -19,7 +19,7 @@ import Leaderboard, {
   TeamRow,
   NoMatch,
   individualBoardState,
-  collapsedAfterViewSwitch,
+  boardUiReducer,
   resolveActiveView,
 } from "@/components/leaderboard";
 import type { ResolvedModule } from "@/lib/modules";
@@ -476,10 +476,28 @@ describe("leaderboard edge cases (#481)", () => {
   });
 
   it("does not carry an expanded row across views", () => {
-    // The toggle clears `expanded` on every switch, so the other view
-    // starts closed even when a team row shares the old login's slug
-    // ("red-team"). Dropping the clear from the onClick reopens it.
-    expect(collapsedAfterViewSwitch()).toBeNull();
+    // The toggle dispatches switchView, which sets the view and clears
+    // `expanded`, so the other view starts closed even when a team row
+    // shares the old login's slug ("red-team"). Dropping the clear from
+    // the reducer reopens it.
+    expect(boardUiReducer({ view: "individual", expanded: "red-team" }, { type: "switchView", view: "teams" })).toEqual({
+      view: "teams",
+      expanded: null,
+    });
+    // Switching to the view already shown still closes whatever is open.
+    expect(boardUiReducer({ view: "teams", expanded: "alice" }, { type: "switchView", view: "teams" })).toEqual({
+      view: "teams",
+      expanded: null,
+    });
+    // Toggling still opens and closes rows.
+    expect(boardUiReducer({ view: "individual", expanded: null }, { type: "toggleRow", key: "alice" })).toEqual({
+      view: "individual",
+      expanded: "alice",
+    });
+    expect(boardUiReducer({ view: "individual", expanded: "alice" }, { type: "toggleRow", key: "alice" })).toEqual({
+      view: "individual",
+      expanded: null,
+    });
   });
 
   it("falls back to the individual view when the teams disappear", () => {
@@ -502,5 +520,7 @@ describe("leaderboard edge cases (#481)", () => {
     expect(html).toContain("alice");
     expect(html).toMatch(/Sort:/);
     expect(html).not.toMatch(/aria-pressed/);
+    // Back on the individual board, so the box searches contestants.
+    expect(html).toContain('placeholder="Search contestants…"');
   });
 });

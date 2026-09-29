@@ -3,11 +3,12 @@
 // Interactive leaderboard.
 //
 // This is a Client Component because everything here needs the browser:
-// useState for the query/view/sort/expand state. The server page loads the
+// useState for the query/sort state and useReducer for the view/expand
+// state. The server page loads the
 // data (and the viewer's session) and hands both down as props — data
 // fetching and auth stay on the server, interactivity on the client.
 
-import { useMemo, useState } from "react";
+import { useMemo, useReducer, useState } from "react";
 import Image from "next/image";
 import Link from "next/link";
 import { completedCount } from "@/lib/leaderboard/rank";
@@ -40,11 +41,20 @@ export function individualBoardState(
   return "list";
 }
 
-/** Switching views always closes whatever row is open. The toggle can't
- *  keep the slug: a team row shares its key space with the individual
- *  rows, so carrying it over reopens the wrong row. */
-export function collapsedAfterViewSwitch(): null {
-  return null;
+/** View plus whichever row is expanded. Switching views always closes
+ *  whatever row is open: a team row shares its key space with the
+ *  individual rows, so carrying the slug over reopens the wrong row. */
+export type BoardUi = { view: View; expanded: string | null };
+export type BoardUiAction =
+  | { type: "switchView"; view: View }
+  | { type: "toggleRow"; key: string };
+export function boardUiReducer(state: BoardUi, action: BoardUiAction): BoardUi {
+  switch (action.type) {
+    case "switchView":
+      return { view: action.view, expanded: null };
+    case "toggleRow":
+      return { ...state, expanded: state.expanded === action.key ? null : action.key };
+  }
 }
 
 /** The teams view only exists while the toggle does. If the last team
@@ -147,9 +157,11 @@ export default function Leaderboard({
   const sortKeys: SortKey[] = ["rank", "points", "solved"];
 
   const [query, setQuery] = useState("");
-  const [view, setView] = useState<View>(showTeamsToggle ? "teams" : "individual");
+  const [{ view, expanded }, dispatch] = useReducer(boardUiReducer, {
+    view: showTeamsToggle ? "teams" : "individual",
+    expanded: null,
+  });
   const [sort, setSort] = useState<SortKey>("rank");
-  const [expanded, setExpanded] = useState<string | null>(null);
 
   // If teams are deleted while viewing them, force the view back to individual
   const activeView = resolveActiveView(view, showTeamsToggle);
@@ -264,7 +276,7 @@ export default function Leaderboard({
               <button
                 key={v}
                 type="button"
-                onClick={() => { setView(v); setExpanded(collapsedAfterViewSwitch()); }}
+                onClick={() => dispatch({ type: "switchView", view: v })}
                 aria-pressed={activeView === v}
                 className={`rounded-full border px-3 py-1 text-xs font-medium capitalize transition-colors focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[#d4a017] ${
                   activeView === v
@@ -327,7 +339,7 @@ export default function Leaderboard({
                 topPoints={topPoints}
                 isOwn={viewerLogin === entry.login}
                 isOpen={expanded === entry.login}
-                onToggle={() => setExpanded(expanded === entry.login ? null : entry.login)}
+                onToggle={() => dispatch({ type: "toggleRow", key: entry.login })}
                 capabilities={data.capabilities}
                 modules={modules}
                 completable={data.completable}
@@ -349,7 +361,7 @@ export default function Leaderboard({
               pointsByLogin={pointsByLogin}
               modules={modules}
               isOpen={expanded === team.slug}
-              onToggle={() => setExpanded(expanded === team.slug ? null : team.slug)}
+              onToggle={() => dispatch({ type: "toggleRow", key: team.slug })}
               enabledApps={enabledApps}
             />
           ))}
