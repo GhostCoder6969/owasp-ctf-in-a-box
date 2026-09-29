@@ -553,7 +553,9 @@ reviews:
         POST /score carry a bearer token, and the scorer's GET /leaderboard
         and GET /challenges are open by contract (docs/decisions.md ADR 63).
         DO flag: ingress wider than the event needs, an internal write or
-        srh hop with no bearer token, secrets in plaintext
+        srh hop with no bearer token, an internal hop that leaves the stack's
+        network (another VPC or account, or the public internet), secrets in
+        plaintext
         variables or user_data, a variable carrying a token without
         `sensitive = true`, wildcard IAM actions or resources, and resources
         that survive `destroy` and keep billing.
