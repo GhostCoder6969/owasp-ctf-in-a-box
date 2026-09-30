@@ -64,6 +64,14 @@ export function resolveActiveView(requested: View, teamsToggleShown: boolean): V
   return teamsToggleShown ? requested : "individual";
 }
 
+/** Guard for the teams-fallback sync below. It fires only while the stored
+ *  view is still "teams" after the toggle goes away. An open individual
+ *  row must not trip it: expanding a row used to rerun the effect and
+ *  dispatch a reset that closed the row just opened. */
+export function needsTeamsViewReset(teamsToggleShown: boolean, view: View): boolean {
+  return !teamsToggleShown && view === "teams";
+}
+
 /** Shown when the individual board holds no contestants at all (pre-event, or
  *  after a reset) AND the search box is empty. Once the user has typed
  *  anything, a board with nothing to match falls through to NoMatch instead —
@@ -173,10 +181,10 @@ export default function Leaderboard({
   // reducer level — static rendering never runs effects, so no markup
   // test can see this fire.
   useEffect(() => {
-    if (!showTeamsToggle && (view !== "individual" || expanded !== null)) {
+    if (needsTeamsViewReset(showTeamsToggle, view)) {
       dispatch({ type: "switchView", view: "individual" });
     }
-  }, [showTeamsToggle, view, expanded]);
+  }, [showTeamsToggle, view]);
 
   const topPoints = useMemo(
     () => data.entries.reduce((max, e) => Math.max(max, e.points), 0),

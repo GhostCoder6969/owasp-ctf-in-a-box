@@ -22,6 +22,7 @@ import Leaderboard, {
   individualBoardState,
   boardUiReducer,
   resolveActiveView,
+  needsTeamsViewReset,
 } from "@/components/leaderboard";
 import type { ResolvedModule } from "@/lib/modules";
 import { apps } from "@/lib/apps";
@@ -532,5 +533,16 @@ describe("leaderboard edge cases (#481)", () => {
     expect(html).not.toMatch(/aria-pressed/);
     // Back on the individual board, so the box searches contestants.
     expect(html).toContain('placeholder="Search contestants…"');
+  });
+
+  it("leaves an open individual row alone when teams are unavailable", () => {
+    // The fallback sync used to reset whenever `expanded` was non-null,
+    // so opening a row with no teams around re-ran the effect and shut
+    // the row straight away. The guard only fires on the stored teams
+    // view now, widening either half reopens the bug.
+    expect(needsTeamsViewReset(false, "teams")).toBe(true);
+    expect(needsTeamsViewReset(false, "individual")).toBe(false);
+    expect(needsTeamsViewReset(true, "teams")).toBe(false);
+    expect(needsTeamsViewReset(true, "individual")).toBe(false);
   });
 });
