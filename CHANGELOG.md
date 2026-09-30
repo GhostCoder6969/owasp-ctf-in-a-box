@@ -8,6 +8,8 @@ repo-level — `apps/web/package.json` tracks the current tag; `scorer` and
 
 ## Unreleased
 
+- **The empty board says nobody has scored yet (#482).** Searching a board with no scored contestants used to answer with the spelling nudge, which is wrong when there is nobody to check the spelling against. A typed query now reads "Nobody has scored yet" instead, and only the empty search box still draws the "board is wide open" podium. Covered by regression tests on the board-state helpers.
+
 - **Switching a module off stops its grading (#495).** Turning Quiz,
   Jeopardy or AI off in `/admin` hid the board but left its grading routes
   live: `POST /api/quiz/answer`, `POST /api/classic/submit`, and the AI
@@ -413,7 +415,6 @@ repo-level — `apps/web/package.json` tracks the current tag; `scorer` and
   `patched-scores-right` on the release commit. The `ctf-setup.sh` header
   now describes `launch` in the order it runs: wait for Launch, then make
   the forks public.
-- **The empty board says nobody has scored yet (#482).** A typed query on a board with no scored contestants used to get the spelling nudge, which is wrong when there is no board to check against. It now says nobody has scored yet instead, and only the bare query still draws the "board is wide open" podium. Ships with regression tests for the #481 edge cases.
 
 ## v0.6.0 — 2026-09-20
 

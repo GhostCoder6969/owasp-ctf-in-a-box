@@ -1,9 +1,10 @@
-// Leaderboard is a "use client" component, but it has no effects that run
-// during a plain render (all state is useState with static initial values),
-// so renderToStaticMarkup is enough to check markup — same pattern as
-// score-time-chart.test.tsx and team-card.test.tsx. next/image is mocked
-// because the real component needs Next's image-optimization runtime, which
-// isn't wired up under vitest.
+// Leaderboard is a "use client" component, but its one effect (the
+// teams-fallback sync) never runs under renderToStaticMarkup, so static
+// rendering is enough to check markup — same pattern as
+// score-time-chart.test.tsx and team-card.test.tsx. The effect's transition
+// is the exported `switchView` reducer action, pinned directly below.
+// next/image is mocked because the real component needs Next's
+// image-optimization runtime, which isn't wired up under vitest.
 import { describe, expect, it, vi } from "vitest";
 import { renderToStaticMarkup } from "react-dom/server";
 
@@ -506,6 +507,15 @@ describe("leaderboard edge cases (#481)", () => {
     expect(resolveActiveView("teams", false)).toBe("individual");
     expect(resolveActiveView("teams", true)).toBe("teams");
     expect(resolveActiveView("individual", false)).toBe("individual");
+
+    // And the component commits that way back through the reducer, not just
+    // the derivation: the same action that resets the view drops the
+    // expanded team row, so a stale slug can't reopen under a returning
+    // teams list. Reverting either half flips this.
+    expect(boardUiReducer({ view: "teams", expanded: "red-team" }, { type: "switchView", view: "individual" })).toEqual({
+      view: "individual",
+      expanded: null,
+    });
 
     // What the fallback looks like once it fires: the individual board,
     // not an empty teams filter.

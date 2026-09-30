@@ -8,7 +8,7 @@
 // data (and the viewer's session) and hands both down as props — data
 // fetching and auth stay on the server, interactivity on the client.
 
-import { useMemo, useReducer, useState } from "react";
+import { useEffect, useMemo, useReducer, useState } from "react";
 import Image from "next/image";
 import Link from "next/link";
 import { completedCount } from "@/lib/leaderboard/rank";
@@ -165,6 +165,18 @@ export default function Leaderboard({
 
   // If teams are deleted while viewing them, force the view back to individual
   const activeView = resolveActiveView(view, showTeamsToggle);
+
+  // Commit the way back to the reducer, not just derive it above: the
+  // reset also drops the expanded team row, so a returning teams list
+  // can't reopen a stale slug that now names a different row. The
+  // transition itself is the tested `switchView` action, pinned at the
+  // reducer level — static rendering never runs effects, so no markup
+  // test can see this fire.
+  useEffect(() => {
+    if (!showTeamsToggle && (view !== "individual" || expanded !== null)) {
+      dispatch({ type: "switchView", view: "individual" });
+    }
+  }, [showTeamsToggle, view, expanded]);
 
   const topPoints = useMemo(
     () => data.entries.reduce((max, e) => Math.max(max, e.points), 0),
